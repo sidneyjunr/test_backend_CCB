@@ -1,4 +1,3 @@
-import puppeteer from "puppeteer";
 import path from "path";
 import { fileURLToPath } from "url";
 import fs from "fs";
@@ -1643,10 +1642,22 @@ const montarHtml = (dados) => `<!doctype html>
 let _browserPromise = null;
 const getBrowser = async () => {
   if (!_browserPromise) {
-    _browserPromise = puppeteer.launch({
-      headless: "new",
-      args: ["--no-sandbox", "--disable-setuid-sandbox"],
-    });
+    const isProd = process.env.NODE_ENV === "production";
+    if (isProd) {
+      const { default: puppeteer } = await import("puppeteer-core");
+      const { default: chromium } = await import("@sparticuz/chromium");
+      _browserPromise = puppeteer.launch({
+        args: chromium.args,
+        executablePath: await chromium.executablePath(),
+        headless: chromium.headless,
+      });
+    } else {
+      const { default: puppeteer } = await import("puppeteer");
+      _browserPromise = puppeteer.launch({
+        headless: "new",
+        args: ["--no-sandbox", "--disable-setuid-sandbox"],
+      });
+    }
   }
   return _browserPromise;
 };
