@@ -1,6 +1,5 @@
 # Dependências
 node_modules/
-package-lock.json
 yarn.lock
 
 # Variáveis de ambiente (NUNCA commitar estes arquivos)
@@ -24,6 +23,7 @@ uploads/*
 # IDEs
 .vscode/
 .idea/
+.claude/
 *.swp
 *.swo
 *~
