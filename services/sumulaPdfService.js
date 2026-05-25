@@ -137,21 +137,47 @@ const numeroJogo = (sumula) => {
   return String(id).slice(-6).toUpperCase();
 };
 
-const tecnicoNome = (comissao) =>
-  comissao?.find((m) => /t[eé]cnico$/i.test(m.funcao || "") && !/assist/i.test(m.funcao || ""))?.nome || "";
+// Tecnico principal da comissao — inclui o jogador-tecnico (funcao
+// "Jogador-Tecnico" tambem casa /t[eé]cnico$/).
+const acharTecnicoPrincipal = (comissao) =>
+  comissao?.find(
+    (m) =>
+      /t[eé]cnico$/i.test(m.funcao || "") && !/assist/i.test(m.funcao || ""),
+  ) || null;
+
+const tecnicoNome = (comissao) => {
+  const m = acharTecnicoPrincipal(comissao);
+  if (!m) return "";
+  // FIBA B.4.2 — jogador-tecnico entra com "(CAP)" atras do nome.
+  return m.atleta_id ? `${m.nome || ""} (CAP)` : m.nome || "";
+};
 
 const tecnicoAssinatura = (comissao) =>
-  comissao?.find((m) => /t[eé]cnico$/i.test(m.funcao || "") && !/assist/i.test(m.funcao || ""))?.assinatura_path || "";
+  acharTecnicoPrincipal(comissao)?.assinatura_path || "";
 
 const assistenteNome = (comissao) =>
   comissao?.find((m) => /assist/i.test(m.funcao || ""))?.nome || "";
 
 const boxesPorQuarto = (eventos, equipe, tipo) => {
   const porQ = [0, 0, 0, 0];
+  // FIBA B.9.2 — falta de equipe: somente P/T/U/D de jogador EM QUADRA.
+  // Excluem-se: F (briga, Art. 39), C/B (tecnico/banco — sem jogador_id),
+  // cascatas (cascata_de), faltas de banco/excluido/assistente, marcador
+  // de delegacao acompanhante (marcador_circulo).
+  const TEAM_FOUL = new Set(["P", "P2", "U", "U2", "T", "D"]);
   eventos
     .filter((e) => e.tipo === tipo && !e.cancelado && e.equipe === equipe)
     .forEach((e) => {
-      if (e.quarto >= 1 && e.quarto <= 4) porQ[e.quarto - 1]++;
+      if (e.quarto < 1 || e.quarto > 4) return;
+      if (tipo === "falta") {
+        if (!TEAM_FOUL.has(e.tipo_falta)) return;
+        if (!e.jogador_id) return;
+        if (e.cascata_de) return;
+        if (e.marcador_circulo) return;
+        const cat = e.categoria_pessoa;
+        if (cat && cat !== "jogador_quadra") return;
+      }
+      porQ[e.quarto - 1]++;
     });
   return porQ;
 };
@@ -170,7 +196,11 @@ const timeoutsPorMetade = (eventos, equipe) => {
     .filter((e) => e.tipo === "timeout" && !e.cancelado && e.equipe === equipe)
     .sort((a, b) => a.sequencia - b.sequencia)
     .forEach((e) => {
-      const item = { quarto: e.quarto, minuto: e.minuto_jogo };
+      const item = {
+        quarto: e.quarto,
+        minuto: e.minuto_jogo,
+        perdido_2min: e.perdido_2min === true,
+      };
       if (e.quarto === 1 || e.quarto === 2) primeira.push(item);
       else if (e.quarto === 3 || e.quarto === 4) segunda.push(item);
       else if (e.quarto > 4) prorrogacao.push(item);
@@ -184,9 +214,18 @@ const faltasPorJogador = (eventos, atletaId) =>
       (e) =>
         e.tipo === "falta" &&
         !e.cancelado &&
+        // FIBA B.8.3.13/.14/.15 — B circulada de delegacao acompanhante e
+        // gravada no jogador_id do jogador-tecnico (Head coach), mas NAO e
+        // falta dele: aparece so na linha do tecnico (filtrarFaltasTecnico),
+        // nunca na linha de jogador do roster.
+        !e.marcador_circulo &&
         String(e.jogador_id) === String(atletaId),
     )
     .sort((a, b) => a.sequencia - b.sequencia);
+// FIBA OBRI B-3 — o jogador-tecnico tem UMA linha de jogador com TODAS as
+// faltas: as como jogador (P/T/U/D) e as como tecnico (C/B). As C/B entram
+// como letra pura (sem o numero de lances livres); o numero aparece so na
+// linha "Head coach". montarSlotsFalta({jogadorTecnico:true}) cuida disso.
 
 const codigoFalta = (f) => {
   const base = f.tipo_falta || "";
@@ -198,22 +237,45 @@ const codigoFalta = (f) => {
   return `${base}${ll}${cancel}`;
 };
 
+// FIBA — falta cometida com o atleta no banco (categoria substituto/excluido)
+// NAO conta como entrada em quadra. Apenas faltas em jogador em quadra (ou
+// sem categoria, casos legados) marcam o atleta como tendo participado.
+const faltaEhDeQuadra = (e) =>
+  e.tipo === "falta" &&
+  e.categoria_pessoa !== "substituto" &&
+  e.categoria_pessoa !== "excluido" &&
+  // FIBA Art. 7.9 — falta como tecnico (C/B do jogador-tecnico) ou como
+  // assistente NAO indica entrada em quadra. So conta como entrada uma falta
+  // cometida enquanto o atleta jogava.
+  e.categoria_pessoa !== "tecnico" &&
+  e.categoria_pessoa !== "assistente";
+
 const entrouEmCampo = (sumula, eventos, atletaId) => {
   const id = String(atletaId);
   const jogs = [...sumula.jogadores_a, ...sumula.jogadores_b];
   const j = jogs.find((x) => atletaIdStr(x) === id);
-  if (j?.titular || j?.excluido || j?.desqualificado) return true;
+  if (j?.titular) return true;
   return eventos.some(
     (e) =>
       !e.cancelado &&
       ((e.tipo === "substituicao" && String(e.jogador_entra_id) === id) ||
-        (["ponto", "falta"].includes(e.tipo) && String(e.jogador_id) === id)),
+        (e.tipo === "ponto" && String(e.jogador_id) === id) ||
+        (faltaEhDeQuadra(e) && String(e.jogador_id) === id) ||
+        (e.tipo === "set_em_quadra" &&
+          Array.isArray(e.jogadores_em_quadra) &&
+          e.jogadores_em_quadra.some((x) => String(x) === id))),
   );
 };
 
 // Determina dados de entrada do jogador: se entrou, em que quarto e se é titular.
 // Titulares sempre iniciam no Q1. Não-titulares são detectados pela primeira
-// aparição em eventos (substituição, ponto ou falta), pegando o quarto daquele evento.
+// aparição em eventos (substituição, ponto, falta-em-quadra ou set_em_quadra),
+// pegando o quarto daquele evento.
+// set_em_quadra: snapshot pós-timeout/fim_quarto onde o técnico não anuncia
+// pares — quem aparece pela primeira vez nessa lista também conta como entrada.
+// Falta D em jogador no banco (substituto/excluido) NAO marca entrada — atleta
+// foi desqualificado sem nunca pisar em quadra (FIBA Art. 5: E. so marca quem
+// participou efetivamente do jogo).
 const entradaDadosJogador = (sumula, eventos, atletaId) => {
   const id = String(atletaId);
   const jogs = [...sumula.jogadores_a, ...sumula.jogadores_b];
@@ -224,11 +286,14 @@ const entradaDadosJogador = (sumula, eventos, atletaId) => {
       (e) =>
         !e.cancelado &&
         ((e.tipo === "substituicao" && String(e.jogador_entra_id) === id) ||
-          (["ponto", "falta"].includes(e.tipo) && String(e.jogador_id) === id)),
+          (e.tipo === "ponto" && String(e.jogador_id) === id) ||
+          (faltaEhDeQuadra(e) && String(e.jogador_id) === id) ||
+          (e.tipo === "set_em_quadra" &&
+            Array.isArray(e.jogadores_em_quadra) &&
+            e.jogadores_em_quadra.some((x) => String(x) === id))),
     )
     .sort((a, b) => a.sequencia - b.sequencia)[0];
   if (firstEv) return { entrou: true, quarto: firstEv.quarto, titular: false };
-  if (j?.excluido || j?.desqualificado) return { entrou: true, quarto: 1, titular: false };
   return { entrou: false, quarto: null, titular: false };
 };
 
@@ -345,9 +410,15 @@ const gerarResumoTecnico = (eventos, jogadores, sumula) => {
     else row.extra += v;
     row.total += v;
   }
+  // Scout (pagina 2) segue a mesma ordem do roster da pagina 1: alfabetica
+  // pelo nome do atleta. Mantem alinhamento visual com a tabela principal.
   const linhas = Array.from(stats.values())
     .filter((r) => r.numero !== null && r.numero !== undefined)
-    .sort((a, b) => (a.numero ?? 999) - (b.numero ?? 999));
+    .sort((a, b) =>
+      (a.nome || "").localeCompare(b.nome || "", "pt-BR", {
+        sensitivity: "base",
+      }),
+    );
   const totais = linhas.reduce(
     (acc, r) => {
       acc.q1 += r.q1; acc.q2 += r.q2; acc.q3 += r.q3;
@@ -578,9 +649,9 @@ body{
    B2/B2 no técnico ou D/F em jogador excluído desqualificado em briga).
    As letras ficam no MESMO canto, uma em cima da outra, sem aumentar a
    largura da célula. */
-.R td.dq.dq-stack{display:flex;flex-direction:column;align-items:center;justify-content:center;line-height:1;gap:1px;padding:1px 2px}
+.R td.dq.dq-stack{display:flex;flex-direction:row;align-items:center;justify-content:center;line-height:1;gap:1px;padding:1px 1px}
 .R td.dq.dq-stack .dq-top,
-.R td.dq.dq-stack .dq-bot{font-weight:700;font-size:8.5px;line-height:1}
+.R td.dq.dq-stack .dq-bot{font-weight:700;font-size:9px;line-height:1}
 .R td.dq.dq-stack .dq-top.fq1,
 .R td.dq.dq-stack .dq-bot.fq1{color:#E60000}
 .R td.dq.dq-stack .dq-top.fq2,
@@ -607,6 +678,12 @@ body{
 .R.final tr.st-row td.cf:empty{
   background:linear-gradient(#0000CC,#0000CC) center/100% 2px no-repeat border-box;
 }
+/* FIBA B.8.3.13/.14/.15 — letra circulada (delegacao acompanhante).
+   Wrapper inline-block com SVG por baixo do texto; herdam currentColor das
+   classes .fq1/.fq2 das celulas pai para manter a convencao de cor por quarto. */
+.circ-wrap{position:relative;display:inline-flex;align-items:center;justify-content:center;width:1.6em;height:1.6em;vertical-align:middle;line-height:1}
+.circ-wrap .circ-svg{position:absolute;top:0;left:0;width:100%;height:100%;color:inherit}
+.circ-wrap .circ-txt{position:relative;z-index:1;font-weight:700}
 
 /* ===== CONTAGEM PROGRESSIVA ===== */
 .cp-ttl{text-align:center;font-size:14px;font-weight:800;letter-spacing:3px;padding:5px 0;border-bottom:1.5px solid #000}
@@ -626,10 +703,9 @@ body{
 .cp .hA{color:#000}
 .cp .hB{color:#000}
 /* Cor FIBA por quarto — tudo anotado na súmula segue essa regra:
-   Q1 e Q3 → vermelho; Q2 e Q4 → azul; quartos extras → roxo */
+   Q1 e Q3 → vermelho; Q2, Q4 e prorrogações → azul */
 .cp td.q1,.cp td.q3{color:#E60000}
 .cp td.q2,.cp td.q4{color:#0000CC}
-.cp td.qe{color:#800080}
 /* Índice pré-impresso mantém cor cinza mesmo quando a célula é marcada */
 .cp td span.num{color:#555;font-size:12.5px}
 /* Regra FIBA: bola de 3 pontos — círculo ao redor da camisa (cor do quarto) */
@@ -749,6 +825,9 @@ body{
 .sc-ln{display:flex;align-items:center;gap:4px;margin-bottom:3px;font-size:8.5px;font-weight:700}
 .sp{display:inline-flex;align-items:center;gap:3px;margin-right:10px;font-size:8.5px}
 .sb{display:inline-block;width:28px;text-align:center;border-bottom:1px solid #000;color:#0000CC;font-weight:700;font-size:9px;min-height:13px}
+/* Cor FIBA por quarto na pontuação por período: Q1/Q3 vermelho;
+   Q2/Q4/prorrogações azul (default já azul, override só vermelho). */
+.sc .sb.q1,.sc .sb.q3{color:#E60000}
 
 /* Resultado Final */
 .rs{border-bottom:1px solid #000;padding-bottom:3px;margin-bottom:3px}
@@ -873,12 +952,27 @@ const renderTemposDebitados = (tos) => {
   };
   const cell = (to) => {
     if (!to) return `<td class="empty"></td>`;
+    // TO sintetico "perdido" (Q4 ultimos 2 min com 3/3) — renderiza com os
+    // tracos horizontais do padrao FIBA, na cor do quarto (Q4 = azul).
+    if (to.perdido_2min) {
+      return `<td class="empty ${tqCls(to.quarto)}"></td>`;
+    }
     const cls = tqCls(to.quarto);
     return `<td class="${cls}">${minutoJogado(to)}</td>`;
   };
   const row1 = [0, 1].map((i) => cell(tos.primeira[i])).join("");
   const row2 = [0, 1, 2].map((i) => cell(tos.segunda[i])).join("");
-  const row3 = [0, 1, 2].map((i) => cell(tos.prorrogacao[i])).join("");
+  // Slots da 3a linha sao por prorrogacao (OT1 = caixa 0, OT2 = caixa 1,
+  // OT3 = caixa 2). Localiza o TO daquela equipe naquele OT especifico —
+  // ausencia = caixa vazia (riscada). Garante alinhamento visual entre
+  // equipes mesmo quando uma usa TO em OT2 e a outra em OT3.
+  const row3 = [0, 1, 2]
+    .map((i) => {
+      const targetQ = i + 5;
+      const to = tos.prorrogacao.find((t) => t.quarto === targetQ);
+      return cell(to);
+    })
+    .join("");
   return `
     <div>
       <div class="sec-lbl">TEMPOS DEBITADOS</div>
@@ -932,11 +1026,12 @@ const renderFaltasEquipe = (porQuarto) => {
 };
 
 // Cor do X da coluna E. (entrou em campo) conforme quarto de entrada.
-// Instrução explícita do cliente: no Q1 o X vai azul (titulares recebem
-// círculo vermelho por cima). Nos demais quartos segue a convenção FIBA do
-// restante do documento — Q3 vermelho; Q2, Q4 e prorrogações azuis.
-const entQuartoColor = (q) => {
-  if (q === 3) return "#E60000";
+// FIBA: Q1/Q3 vermelho; Q2/Q4/prorrogações azul.
+// Exceção do cliente: titulares (sempre Q1) recebem X azul para que o
+// círculo vermelho sobreposto fique visível por contraste.
+const entQuartoColor = (q, titular) => {
+  if (titular) return "#0000CC";
+  if (q === 1 || q === 3) return "#E60000";
   return "#0000CC";
 };
 
@@ -960,6 +1055,14 @@ const faltaQuartoCls = (q) => {
   return "";
 };
 
+// FIBA B.8.3.13/.14/.15 — falta de delegacao acompanhante: letra envolvida
+// em circulo (ex.: ⓑ / B₂ circulado). SVG inline preservando cor por quarto.
+const renderSlotText = (text, circled) => {
+  const safe = esc(text);
+  if (!circled) return safe;
+  return `<span class="circ-wrap"><svg class="circ-svg" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="1.6" fill="none"/></svg><span class="circ-txt">${safe}</span></span>`;
+};
+
 // FIBA B.8.3 — monta os "espaços" de falta do jogador. Cada falta ocupa um
 // slot; certas combinações inserem automaticamente um "GD" no espaço seguinte
 // (desqualificação do jogo):
@@ -970,24 +1073,104 @@ const faltaQuartoCls = (q) => {
 // A falta "D" (desqualificante direta, B.8.3.7) não gera GD extra — é ela
 // própria a indicação de desqualificação. Códigos legados P2/U2 viram P/U
 // (os lances livres já carregam o número).
-const montarSlotsFalta = (faltas) => {
+const montarSlotsFalta = (faltas, opts = {}) => {
+  // FIBA OBRI B-3 — modo jogador-tecnico: as faltas como tecnico (C/B) entram
+  // na linha do jogador como letra pura (sem LL) e o GD segue a matriz
+  // combinada B.8.3.7 (T/U como jogador + C/B como tecnico).
+  const ehJT = opts.jogadorTecnico === true;
   const slots = [];
-  let tCount = 0, uCount = 0, bCount = 0;
+  let tCount = 0, uCount = 0, bCount = 0, cCount = 0;
+  let brigaPreenchida = false;
+  let gdInserido = false;
   for (const f of faltas) {
+    if (brigaPreenchida) break; // F ja saturou os slots restantes
     const raw = (f.tipo_falta || "").toUpperCase();
     const base = raw === "P2" ? "P" : raw === "U2" ? "U" : raw;
     const ll = f.lances_livres && f.lances_livres > 0 ? f.lances_livres : "";
     // Sufixo "c" (canceladas reciprocamente — FIBA, ex.: Tc Tc). Aceita
     // tanto a flag manual nova quanto o pareamento legado.
     const cancel = f.cancelada_manual || f.falta_cancelada_por ? "c" : "";
-    slots.push({ text: `${base}${ll}${cancel}`, quarto: f.quarto });
+    // marcador_circulo (delegacao acompanhante — B.8.3.13/.14/.15): renderiza
+    // letra envolvida em circulo SVG (mesmo padrao do circulo do nº na
+    // contagem progressiva). Marcado com flag no slot — render aplica.
+    const circled = !!f.marcador_circulo;
+    // Na linha do jogador-tecnico as faltas COMO TECNICO (C/B e tambem o D/D2
+    // de briga enquanto no banco — categoria_pessoa "tecnico") nao mostram o
+    // numero de lances livres (FIBA OBRI B-3 / Art. 7.9): o numero fica so na
+    // linha "Head coach". A linha de jogador espelha apenas a letra (ex.: D),
+    // nunca "D2", pois os 2 LL sao computados no slot do tecnico.
+    const ehFaltaComoTecnico =
+      base === "C" || base === "B" || f.categoria_pessoa === "tecnico";
+    const llSlot = ehJT && ehFaltaComoTecnico ? "" : ll;
+    slots.push({
+      text: `${base}${llSlot}${cancel}`,
+      quarto: f.quarto,
+      circled,
+    });
+
+    // FIBA B.8.3.14 — falta de briga (F): apos registrada, todos os espacos
+    // restantes do atleta sao preenchidos com "F" (ate 5 slots visiveis +
+    // 1 slot extra na coluna invisivel).
+    // Tambem aplicado quando o evento tem subtipo_briga setado (D ou D2 de
+    // briga) — fluxo registrarBriga cria UM unico evento por envolvido e o
+    // PDF preenche os F automaticamente.
+    // FIBA B.8.3.14 — saturacao F: SO para envolvido direto na briga (D/D2 ou
+    // F isolado). Cascata B2 do tecnico tambem tem subtipo_briga setado mas
+    // NAO satura (B2 unica anotacao no tecnico, nao preenche slots restantes).
+    if (base === "F" || (f.subtipo_briga && base === "D")) {
+      // FIBA B.8.3.14 — F preenche TODOS espacos restantes (visiveis + DQ).
+      // 3 casos pela contagem pre-briga (slots ja preenchidos antes deste push):
+      //   preBrigaLen <  4 → D/D2 cai em slot visivel, F satura ate 5a coluna
+      //                       (atleta desqualificado por briga mas <5 faltas).
+      //   preBrigaLen == 4 → D/D2 vira 5a falta (excluido pela propria briga).
+      //                       F adicional ocupa slot 6 (DQ-top). TOTAL=6.
+      //   preBrigaLen >= 5 → atleta ja estava excluido antes da briga. D/D2
+      //                       cai em slot 6 (DQ-top) e F empilha em slot 7
+      //                       (DQ-bot). TOTAL=7.
+      const preBrigaLen = slots.length - 1;
+      const TOTAL_SLOTS = preBrigaLen >= 5 ? 7 : preBrigaLen >= 4 ? 6 : 5;
+      while (slots.length < TOTAL_SLOTS) {
+        slots.push({ text: "F", quarto: f.quarto });
+      }
+      brigaPreenchida = true;
+      continue;
+    }
 
     let gd = false;
-    if (base === "T") { tCount++; if (tCount >= 2 || uCount >= 1) gd = true; }
-    else if (base === "U") { uCount++; if (uCount >= 2 || tCount >= 1) gd = true; }
-    else if (base === "B" || base === "C") { bCount++; if (bCount >= 3) gd = true; }
+    if (ehJT) {
+      // FIBA B.8.3.7 / OBRI 36-27 — matriz combinada do jogador-tecnico:
+      // soma faltas como jogador (T/U) com faltas como tecnico (C/B).
+      if (base === "T") tCount++;
+      else if (base === "U") uCount++;
+      else if (base === "C" && !circled) cCount++;
+      else if (base === "B" && !circled) bCount++;
+      const playerTU = tCount + uCount;
+      gd =
+        playerTU >= 2 ||
+        cCount >= 2 ||
+        bCount >= 3 ||
+        (cCount >= 1 && playerTU >= 1) ||
+        (bCount >= 2 && playerTU >= 1) ||
+        (cCount >= 1 && bCount >= 2);
+    } else if (base === "T") {
+      tCount++;
+      if (tCount >= 2 || uCount >= 1) gd = true;
+    } else if (base === "U") {
+      uCount++;
+      if (uCount >= 2 || tCount >= 1) gd = true;
+    } else if (base === "B" || base === "C") {
+      // Delegacao acompanhante NAO conta para o limite de 3 tecnicas que
+      // gera GD (FIBA B.8.3.13/.14/.15).
+      if (!circled) {
+        bCount++;
+        if (bCount >= 3) gd = true;
+      }
+    }
 
-    if (gd) slots.push({ text: "GD", quarto: f.quarto });
+    if (gd && !gdInserido) {
+      slots.push({ text: "GD", quarto: f.quarto });
+      gdInserido = true;
+    }
   }
   return slots;
 };
@@ -1004,8 +1187,19 @@ const renderRoster = (
   tecSig,
   faltasTecnico = [],
   faltasAssistente = [],
+  assLabel = "1º ASSIST. TÉCNICO",
 ) => {
-  const sorted = [...jogadores].sort((a, b) => (a.numero ?? 999) - (b.numero ?? 999));
+  // Padrao FIBA do roster: ordem alfabetica pelo nome do atleta. O numero
+  // da camisa permanece visivel na coluna Nº mas nao define a ordem.
+  // Atletas sem numero (chegaram atrasados e nunca receberam numero) nao
+  // aparecem na sumula oficial.
+  const sorted = [...jogadores]
+    .filter((j) => j.numero !== null && j.numero !== undefined)
+    .sort((a, b) =>
+      atletaNome(a).localeCompare(atletaNome(b), "pt-BR", {
+        sensitivity: "base",
+      }),
+    );
   // Quando a súmula está finalizada, a tabela ganha a classe .final para que
   // os espaços de falta vazios recebam os traços horizontais de inutilização
   // (FIBA B.8.4).
@@ -1071,7 +1265,9 @@ const renderRoster = (
     }
     const aid = atletaIdStr(j);
     const faltasAll = faltasPorJogador(eventos, aid);
-    const slots = montarSlotsFalta(faltasAll);
+    const slots = montarSlotsFalta(faltasAll, {
+      jogadorTecnico: !!j.jogador_tecnico,
+    });
     const n2 = slots.slice(0, 5).filter((s) => s.quarto <= 2).length;
     const nTotal = Math.min(slots.length, 5);
     const h = halftimePassed && n2 < 5 ? n2 : null;
@@ -1160,11 +1356,11 @@ const renderRoster = (
       const extra = cellSepClass(i, idx);
       const s = slots[idx];
       if (!s) return `<td class="fl${extra}"></td>`;
-      return `<td class="fl ${faltaQuartoCls(s.quarto)}${extra}">${esc(s.text)}</td>`;
+      return `<td class="fl ${faltaQuartoCls(s.quarto)}${extra}">${renderSlotText(s.text, s.circled)}</td>`;
     }).join("");
     const entrada = entradaDadosJogador(sumula, eventos, aid);
     const entCell = entrada.entrou
-      ? entSvg(entQuartoColor(entrada.quarto), entrada.titular)
+      ? entSvg(entQuartoColor(entrada.quarto, entrada.titular), entrada.titular)
       : "";
     const num = j.numero ?? "";
     // 6ª célula invisível — só aparece quando a regra FIBA gerou um 6º slot,
@@ -1180,9 +1376,9 @@ const renderRoster = (
     const slot7 = slots[6];
     let dqCell;
     if (slot6 && slot7) {
-      dqCell = `<td class="dq dq-stack"><span class="dq-top ${faltaQuartoCls(slot6.quarto)}">${esc(slot6.text)}</span><span class="dq-bot ${faltaQuartoCls(slot7.quarto)}">${esc(slot7.text)}</span></td>`;
+      dqCell = `<td class="dq dq-stack"><span class="dq-top ${faltaQuartoCls(slot6.quarto)}">${renderSlotText(slot6.text, slot6.circled)}</span><span class="dq-bot ${faltaQuartoCls(slot7.quarto)}">${renderSlotText(slot7.text, slot7.circled)}</span></td>`;
     } else if (slot6) {
-      dqCell = `<td class="dq ${faltaQuartoCls(slot6.quarto)}">${esc(slot6.text)}</td>`;
+      dqCell = `<td class="dq ${faltaQuartoCls(slot6.quarto)}">${renderSlotText(slot6.text, slot6.circled)}</td>`;
     } else {
       dqCell = `<td class="dq"></td>`;
     }
@@ -1211,7 +1407,7 @@ const renderRoster = (
         const sl = stSlots[i];
         const sepCls = cellSepClass(rowIdx, flCol);
         const qCls = sl ? ` ${faltaQuartoCls(sl.quarto)}` : "";
-        return `<td class="cf${sepCls}${qCls}">${sl ? esc(sl.text) : ""}</td>`;
+        return `<td class="cf${sepCls}${qCls}">${sl ? renderSlotText(sl.text, sl.circled) : ""}</td>`;
       })
       .join("");
     return `
@@ -1222,7 +1418,7 @@ const renderRoster = (
     </tr>`;
   };
   const tecRow = stRow("TÉCNICO", tec || "", tecSig || "", 12);
-  const assRow = stRow("1º ASSIST. TÉCNICO", ass || "", "", 13);
+  const assRow = stRow(assLabel, ass || "", "", 13);
   return `
     <table class="R${jogoFinalizado ? " final" : ""}">
       ${colgroup}
@@ -1241,14 +1437,20 @@ const renderTeamBlock = ({ sumula, eventos, equipe, label, nome, jogadores, comi
   const tempos = timeoutsPorMetade(eventos, equipe);
   const faltas = boxesPorQuarto(eventos, equipe, "falta");
   const tec = esc(tecnicoNome(comissao)).toUpperCase();
-  const ass = esc(assistenteNome(comissao)).toUpperCase();
+  let ass = esc(assistenteNome(comissao)).toUpperCase();
+  let assLabel = "1º ASSIST. TÉCNICO";
   const tecSig = tecnicoAssinatura(comissao) || "";
   // Resolve ids para extrair faltas C/B da comissao tecnica.
   const tecMembro = (comissao || []).find(
     (m) => /t[eé]cnico$/i.test(m.funcao || "") && !/assist/i.test(m.funcao || ""),
   );
   const assMembro = (comissao || []).find((m) => /assist/i.test(m.funcao || ""));
-  const tecId = tecMembro?.tecnico_id ? String(tecMembro.tecnico_id) : null;
+  // FIBA Art. 7.9 — jogador-tecnico: a comissao guarda atleta_id no lugar de
+  // tecnico_id; as faltas C/B caem em jogador_id com categoria "tecnico".
+  const tecEhJogador = !!tecMembro?.atleta_id;
+  const tecId = tecMembro
+    ? String(tecMembro.atleta_id || tecMembro.tecnico_id || "") || null
+    : null;
   const assId = assMembro?.tecnico_id ? String(assMembro.tecnico_id) : null;
   // Tecnico principal recebe C/B/B2 (incluindo cascata B.8.3.10) + eventual D
   // se for desqualificado diretamente.
@@ -1261,11 +1463,19 @@ const renderTeamBlock = ({ sumula, eventos, equipe, label, nome, jogadores, comi
           e.equipe === equipe &&
           ["C", "B", "D"].includes(e.tipo_falta) &&
           alvoId &&
-          e.tecnico_id &&
-          String(e.tecnico_id) === alvoId,
+          (tecEhJogador
+            ? e.jogador_id &&
+              String(e.jogador_id) === alvoId &&
+              e.categoria_pessoa === "tecnico"
+            : e.tecnico_id && String(e.tecnico_id) === alvoId),
       )
       .sort((a, b) => a.sequencia - b.sequencia);
-  // Assistente so pode receber D. Listar so os Ds atribuidos a ele.
+  // Assistente: na regra geral so recebe D direto. Mas FIBA Art. 37 — quando
+  // o tecnico principal e desqualificado, o 1o assistente assume e passa a
+  // receber C (input direto), B (cascata B2 ou direto) e D atribuidos ao
+  // tecnico_id dele. Listar todos os C/B/D do assistente_id para que tanto o
+  // fluxo "assistente normal" quanto o "atua como tecnico" sejam refletidos
+  // na linha do PDF.
   const filtrarFaltasAssistente = (alvoId) =>
     eventos
       .filter(
@@ -1273,14 +1483,40 @@ const renderTeamBlock = ({ sumula, eventos, equipe, label, nome, jogadores, comi
           e.tipo === "falta" &&
           !e.cancelado &&
           e.equipe === equipe &&
-          e.tipo_falta === "D" &&
+          ["C", "B", "D"].includes(e.tipo_falta) &&
           alvoId &&
           e.tecnico_id &&
           String(e.tecnico_id) === alvoId,
       )
       .sort((a, b) => a.sequencia - b.sequencia);
   const faltasTecnico = filtrarFaltasTecnico(tecId);
-  const faltasAssistente = filtrarFaltasAssistente(assId);
+  let faltasAssistente = filtrarFaltasAssistente(assId);
+
+  // FIBA Art. 7.9 — 2o capitao: quando o jogador-tecnico titular e expulso e a
+  // equipe nao tem assistente inscrito, o novo capitao assume como
+  // jogador-tecnico (tecnico_sucessor). Ele ocupa a linha do 1o assistente com
+  // o sufixo "(2o CAP)"; suas faltas C/B/D caem em jogador_id + categoria
+  // "tecnico" (igual ao jogador-tecnico original).
+  const sucessor = (jogadores || []).find((j) => j.tecnico_sucessor);
+  if (!assMembro && sucessor) {
+    const sucId = String(sucessor.atleta_id?._id || sucessor.atleta_id || "");
+    assLabel = "2º CAPITÃO";
+    ass = `${esc(atletaNome(sucessor))} (2º CAP)`.toUpperCase();
+    faltasAssistente = sucId
+      ? eventos
+          .filter(
+            (e) =>
+              e.tipo === "falta" &&
+              !e.cancelado &&
+              e.equipe === equipe &&
+              ["C", "B", "D"].includes(e.tipo_falta) &&
+              e.jogador_id &&
+              String(e.jogador_id) === sucId &&
+              e.categoria_pessoa === "tecnico",
+          )
+          .sort((a, b) => a.sequencia - b.sequencia)
+      : [];
+  }
 
   // Técnico e 1º assistente são emitidos como as duas últimas linhas da
   // própria tabela .R (renderRoster), preservando a estrutura FIBA sem ter
@@ -1297,7 +1533,7 @@ const renderTeamBlock = ({ sumula, eventos, equipe, label, nome, jogadores, comi
       ${renderTemposDebitados(tempos)}
       ${renderFaltasEquipe(faltas)}
     </div>
-    ${renderRoster(jogadores, eventos, sumula, tec, ass, tecSig, faltasTecnico, faltasAssistente)}
+    ${renderRoster(jogadores, eventos, sumula, tec, ass, tecSig, faltasTecnico, faltasAssistente, assLabel)}
   </div>`;
 };
 
@@ -1327,7 +1563,7 @@ const renderContagemProgressiva = (eventos, sumula) => {
     if (q === 2) return "q2";
     if (q === 3) return "q3";
     if (q === 4) return "q4";
-    if (q && q > 4) return "qe";
+    if (q && q > 4) return "q2"; // prorrogações herdam azul
     return "";
   };
 
@@ -1413,7 +1649,7 @@ const renderContagemProgressiva = (eventos, sumula) => {
    RENDER — Rodapé de Encerramento
    ==================================================================== */
 
-const renderFooter = (sumula, estado) => {
+const renderFooter = (sumula, estado, eventos = []) => {
   const mesa = sumula.mesa || {};
   const placarA = sumula.placar_final?.pontos_a ?? estado.placar.A;
   const placarB = sumula.placar_final?.pontos_b ?? estado.placar.B;
@@ -1428,6 +1664,39 @@ const renderFooter = (sumula, estado) => {
     return { a: p?.pontos_a ?? estado.placar_por_quarto?.[q]?.A ?? 0, b: p?.pontos_b ?? estado.placar_por_quarto?.[q]?.B ?? 0 };
   };
   const q1=pq(1), q2=pq(2), q3=pq(3), q4=pq(4);
+
+  // Quartos extras (prorrogações): soma de TODOS os q>4 a partir das fontes
+  // disponíveis. Prioridade: placar_por_quarto registrado na súmula → estado
+  // em memória → fallback agregando eventos de ponto. Toda regra de OT segue
+  // a cor azul (FIBA: Q2/Q4/OT azul).
+  let extraA = 0, extraB = 0, hasExtra = false;
+  for (const p of sumula.placar_por_quarto || []) {
+    if (p.quarto > 4) {
+      extraA += p.pontos_a || 0;
+      extraB += p.pontos_b || 0;
+      hasExtra = true;
+    }
+  }
+  if (!hasExtra && estado.placar_por_quarto) {
+    for (const k of Object.keys(estado.placar_por_quarto)) {
+      const q = Number(k);
+      if (q > 4) {
+        extraA += estado.placar_por_quarto[k].A || 0;
+        extraB += estado.placar_por_quarto[k].B || 0;
+        hasExtra = true;
+      }
+    }
+  }
+  if (!hasExtra) {
+    for (const e of eventos) {
+      if (e.tipo !== "ponto" || e.cancelado || !(e.quarto > 4)) continue;
+      const v = e.valor || 0;
+      if (e.equipe === "A") extraA += v;
+      else if (e.equipe === "B") extraB += v;
+      hasExtra = true;
+    }
+  }
+  const extraTxt = (n) => (hasExtra ? String(n) : "-");
 
   return `
   <div class="F">
@@ -1454,20 +1723,20 @@ const renderFooter = (sumula, estado) => {
         <div class="sc-ln">
           <span class="qt">QUARTO</span>
           <span class="qc">1</span>
-          <span class="sp">A <span class="sb">${q1.a}</span> B <span class="sb">${q1.b}</span></span>
+          <span class="sp">A <span class="sb q1">${q1.a}</span> B <span class="sb q1">${q1.b}</span></span>
           <span class="qc">2</span>
-          <span class="sp">A <span class="sb">${q2.a}</span> B <span class="sb">${q2.b}</span></span>
+          <span class="sp">A <span class="sb q2">${q2.a}</span> B <span class="sb q2">${q2.b}</span></span>
         </div>
         <div class="sc-ln">
           <span class="qt">QUARTO</span>
           <span class="qc">3</span>
-          <span class="sp">A <span class="sb">${q3.a}</span> B <span class="sb">${q3.b}</span></span>
+          <span class="sp">A <span class="sb q3">${q3.a}</span> B <span class="sb q3">${q3.b}</span></span>
           <span class="qc">4</span>
-          <span class="sp">A <span class="sb">${q4.a}</span> B <span class="sb">${q4.b}</span></span>
+          <span class="sp">A <span class="sb q4">${q4.a}</span> B <span class="sb q4">${q4.b}</span></span>
         </div>
         <div class="sc-ln">
           <span class="qt">QUARTOS EXTRAS</span>
-          <span class="sp">A <span class="sb">-</span> B <span class="sb">-</span></span>
+          <span class="sp">A <span class="sb q2">${extraTxt(extraA)}</span> B <span class="sb q2">${extraTxt(extraB)}</span></span>
         </div>
       </div>
 
@@ -1518,7 +1787,7 @@ const gerarPagina1 = ({ sumula, estado, eventos }) => {
       ${renderContagemProgressiva(eventos, sumula)}
     </div>
 
-    ${renderFooter(sumula, estado)}
+    ${renderFooter(sumula, estado, eventos)}
   </div>`;
 };
 

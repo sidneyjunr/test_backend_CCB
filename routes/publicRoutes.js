@@ -10,6 +10,9 @@ import {
   getScoutJogo,
   getCompeticoesPublic,
   getSumulaPublic,
+  getAoVivoAbertura,
+  streamAoVivo,
+  streamHomeAoVivo,
 } from "../controllers/publicController.js";
 
 const router = express.Router();
@@ -219,6 +222,13 @@ router.get("/estatisticas", getEstatisticas);
 router.get("/atleta/:id/pontos", getPontosAtleta);
 
 router.get("/jogo/:id/scout", getScoutJogo);
+
+// Stream agregado da home (1 conexão p/ todos os jogos ao vivo).
+router.get("/ao-vivo/home/stream", streamHomeAoVivo);
+
+// Visão ao vivo: snapshot inicial + stream SSE da parte dinâmica.
+router.get("/jogo/:id/ao-vivo", getAoVivoAbertura);
+router.get("/jogo/:id/ao-vivo/stream", streamAoVivo);
 
 router.get("/competicoes", getCompeticoesPublic);
 

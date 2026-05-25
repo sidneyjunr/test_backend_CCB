@@ -17,6 +17,12 @@ const InscricaoSchema = new mongoose.Schema(
       ref: "Competicao",
       required: true,
     },
+    categoria_id: {
+      type: mongoose.Schema.Types.ObjectId,
+      required: true,
+      description:
+        "Categoria da competição em que o atleta está inscrito (copiado de equipe.categoria_id).",
+    },
 
     ja_jogou: { type: Boolean, default: false },
     status: {
@@ -37,6 +43,7 @@ const InscricaoSchema = new mongoose.Schema(
 );
 
 InscricaoSchema.index({ atleta_id: 1, equipe_id: 1, competicao_id: 1 });
+InscricaoSchema.index({ atleta_id: 1, categoria_id: 1, ja_jogou: 1 });
 InscricaoSchema.index({ status: 1 });
 
 export const Inscricao = mongoose.model("Inscricao", InscricaoSchema);

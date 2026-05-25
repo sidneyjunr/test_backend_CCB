@@ -11,16 +11,24 @@ import { Escalacao } from "../models/Escalacao.js";
 import { Inscricao } from "../models/Inscricao.js";
 import { Arbitro } from "../models/Arbitro.js";
 import { Tecnico } from "../models/Tecnico.js";
+import { Atleta } from "../models/Atleta.js";
 import { gerarSumulaPdf } from "../services/sumulaPdfService.js";
+import {
+  computarEstado,
+  montarDinamicoAoVivo,
+  QUARTO_FIM_PRIMEIRA_METADE,
+  QUARTO_FINAL,
+} from "../services/sumulaEstadoService.js";
+import * as aoVivoBus from "../services/aoVivoBus.js";
 
 const FALTAS_PESSOAIS_LIMITE = 5;
 // FIBA B.8.4: 2 TO na primeira metade, 3 na segunda metade.
-// Nos ultimos 2 min do Q4, o tecnico ganha +1 TO adicional alem do limite.
+// Nos ultimos 2 min do Q4, se a equipe ainda tiver 3/3 disponiveis, perde
+// automaticamente o 1o TO (regra do "uso ou perde"). O sistema registra um
+// evento timeout sintetico com perdido_2min=true antes do TO real.
 const TIMEOUTS_PRIMEIRA_METADE = 2;
 const TIMEOUTS_SEGUNDA_METADE = 3;
-const TIMEOUTS_BONUS_ULTIMOS_2MIN = 1;
-const QUARTO_FIM_PRIMEIRA_METADE = 2;
-const QUARTO_FINAL = 4;
+// QUARTO_FIM_PRIMEIRA_METADE e QUARTO_FINAL vêm de sumulaEstadoService.js.
 
 const limiteTimeoutsMetade = (metade) =>
   metade === "primeira" ? TIMEOUTS_PRIMEIRA_METADE : TIMEOUTS_SEGUNDA_METADE;
@@ -38,69 +46,245 @@ const findJogadorEmSumula = (sumula, equipe, atletaId) => {
   );
 };
 
-const computarEstado = async (sumulaId) => {
-  const eventos = await EventoSumula.find({
-    sumula_id: sumulaId,
-    cancelado: false,
-  }).sort({ sequencia: 1 });
-
-  const estado = {
-    placar: { A: 0, B: 0 },
-    placar_por_quarto: {},
-    faltas_equipe_por_quarto: {},
-    timeouts: { A: { primeira: 0, segunda: 0 }, B: { primeira: 0, segunda: 0 } },
-    faltas_jogador: {},
-    pontos_jogador: {},
-    eventos,
-  };
-
-  // Faltas que contam como pessoal do atleta (C e B sao do tecnico).
-  const FALTAS_PESSOAIS = ["P", "P2", "U", "U2", "T", "D"];
-
-  for (const ev of eventos) {
-    if (ev.tipo === "ponto") {
-      estado.placar[ev.equipe] += ev.valor;
-      const key = ev.quarto;
-      estado.placar_por_quarto[key] = estado.placar_por_quarto[key] || {
-        A: 0,
-        B: 0,
-      };
-      estado.placar_por_quarto[key][ev.equipe] += ev.valor;
-      if (ev.jogador_id) {
-        const pk = ev.jogador_id.toString();
-        estado.pontos_jogador[pk] = (estado.pontos_jogador[pk] || 0) + ev.valor;
-      }
-    }
-    if (ev.tipo === "falta") {
-      const fKey = `${ev.quarto}-${ev.equipe}`;
-      // FIBA: faltas que contam como falta de equipe sao P/T/U/D cometidas
-      // por jogador EM QUADRA. Excluem-se: B/C (tecnico/banco), B2 cascata
-      // (B.8.3.10), faltas de briga (Art. 39) e falta de jogador excluido
-      // (registrada contra o tecnico). Categoria 'jogador_quadra' eh o filtro.
-      const ehFaltaJogadorQuadra =
-        FALTAS_PESSOAIS.includes(ev.tipo_falta) &&
-        ev.jogador_id &&
-        !ev.cascata_de &&
-        (ev.categoria_pessoa === "jogador_quadra" ||
-          ev.categoria_pessoa == null); // null = legado, assume jogador_quadra
-      if (ehFaltaJogadorQuadra) {
-        estado.faltas_equipe_por_quarto[fKey] =
-          (estado.faltas_equipe_por_quarto[fKey] || 0) + 1;
-      }
-      if (FALTAS_PESSOAIS.includes(ev.tipo_falta) && ev.jogador_id) {
-        const jogadorKey = ev.jogador_id.toString();
-        estado.faltas_jogador[jogadorKey] =
-          (estado.faltas_jogador[jogadorKey] || 0) + 1;
-      }
-    }
-    if (ev.tipo === "timeout") {
-      const metade = ev.quarto <= QUARTO_FIM_PRIMEIRA_METADE ? "primeira" : "segunda";
-      estado.timeouts[ev.equipe][metade] += 1;
-    }
-  }
-
-  return estado;
+// Comissao da equipe (membros principal + assistente).
+const obterComissaoMembros = (sumula, equipe) => {
+  const comissao = equipe === "A" ? sumula.comissao_a : sumula.comissao_b;
+  const principal = (comissao || []).find((m) => {
+    const fn = (m.funcao || "").toLowerCase();
+    return /tecnico/.test(fn) && !/assist/.test(fn);
+  });
+  const assistente = (comissao || []).find((m) => {
+    const fn = (m.funcao || "").toLowerCase();
+    return /assist/.test(fn);
+  });
+  return { principal, assistente };
 };
+
+// FIBA Art. 7.9 — jogador-tecnico ATIVO (o que atua como tecnico agora).
+// Prefere o nao-desqualificado (2o capitao sucessor) sobre o original ja
+// expulso. Quando o original e expulso e ninguem assumiu ainda, retorna ele
+// mesmo (desqualificado) — sinaliza que a equipe precisa de um 2o CAP.
+const acharJogadorTecnicoAtivo = (lista) => {
+  const list = lista || [];
+  return (
+    list.find((j) => j.jogador_tecnico && !j.desqualificado) ||
+    list.find((j) => j.jogador_tecnico) ||
+    null
+  );
+};
+
+// Reverte a sucessao do 2o capitao quando um undo "des-expulsa" o
+// jogador-tecnico original (cascata/falta cancelada). Restaura a capitania e
+// limpa as flags do sucessor. Retorna true se houve mudanca.
+const reverterSucessaoSeReintegrado = (sumula, equipe) => {
+  const { principal, assistente } = obterComissaoMembros(sumula, equipe);
+  if (!principal?.atleta_id || assistente) return false;
+  const lista = equipe === "A" ? sumula.jogadores_a : sumula.jogadores_b;
+  const sucessor = (lista || []).find((j) => j.tecnico_sucessor);
+  if (!sucessor) return false;
+  const original = (lista || []).find(
+    (j) => j.atleta_id && j.atleta_id.toString() === String(principal.atleta_id),
+  );
+  if (original && !original.desqualificado) {
+    sucessor.tecnico_sucessor = false;
+    sucessor.jogador_tecnico = false;
+    sucessor.capitao = false;
+    original.capitao = true;
+    return true;
+  }
+  return false;
+};
+
+// FIBA Art. 38.2.4 — tecnico desqualificado se: 2 C diretas OU 3 totais (C+B).
+// FIBA — assistente desqualificado com 1 D direto.
+// Recebe lista de eventos ja carregada (nao acessa DB).
+const calcularStatusComissao = (eventos, equipe, principalId, assistenteId) => {
+  const ativos = eventos.filter((e) => !e.cancelado && e.equipe === equipe);
+  // FIBA B.8.3.13/.14/.15 — faltas de delegacao acompanhante (marcador_circulo)
+  // NAO contam para o limite de 3 tecnicas que gera GD do tecnico.
+  const principalC = principalId
+    ? ativos.filter(
+        (e) =>
+          e.tipo === "falta" &&
+          e.tipo_falta === "C" &&
+          !e.marcador_circulo &&
+          e.tecnico_id &&
+          String(e.tecnico_id) === String(principalId),
+      ).length
+    : 0;
+  const principalB = principalId
+    ? ativos.filter(
+        (e) =>
+          e.tipo === "falta" &&
+          e.tipo_falta === "B" &&
+          !e.marcador_circulo &&
+          e.tecnico_id &&
+          String(e.tecnico_id) === String(principalId),
+      ).length
+    : 0;
+  const principalD = principalId
+    ? ativos.filter(
+        (e) =>
+          e.tipo === "falta" &&
+          e.tipo_falta === "D" &&
+          e.tecnico_id &&
+          String(e.tecnico_id) === String(principalId),
+      ).length
+    : 0;
+  const assistenteD = assistenteId
+    ? ativos.filter(
+        (e) =>
+          e.tipo === "falta" &&
+          e.tipo_falta === "D" &&
+          e.tecnico_id &&
+          String(e.tecnico_id) === String(assistenteId),
+      ).length
+    : 0;
+  const tecnicoFora =
+    principalC >= 2 || principalC + principalB >= 3 || principalD >= 1;
+  const assistenteFora = assistenteD >= 1;
+  return {
+    tecnicoFora,
+    assistenteFora,
+    principalC,
+    principalB,
+    principalD,
+    assistenteD,
+  };
+};
+
+// FIBA Art. 7.9 / B.8.3.7 / OBRI 36-27 — jogador-tecnico (player head coach).
+// Soma faltas como jogador (T/U) com faltas como tecnico (C/B) para o GD
+// automatico, e conta P/T/U/D/F como jogador para o limite de 5 (excluido
+// como jogador, mas segue como tecnico — Art. 40.2).
+const calcularStatusJogadorTecnico = (eventos, equipe, atletaId) => {
+  if (!atletaId) return null;
+  const alvo = String(atletaId);
+  const ativos = eventos.filter(
+    (e) =>
+      !e.cancelado &&
+      e.equipe === equipe &&
+      e.tipo === "falta" &&
+      e.jogador_id &&
+      String(e.jogador_id) === alvo,
+  );
+  const contar = (tipos, opts = {}) =>
+    ativos.filter((e) => {
+      if (!tipos.includes(e.tipo_falta)) return false;
+      // FIBA B.8.3.13/.14/.15 — falta de delegacao acompanhante (circulada)
+      // nao conta para o GD do tecnico.
+      if (opts.semCirculo && e.marcador_circulo) return false;
+      return true;
+    }).length;
+  // Faltas que contam para o limite de 5 (FIBA Art. 40 / OBRI 36-33). Inclui
+  // as faltas como tecnico (C/B) — o jogador-tecnico e excluido como jogador
+  // ao somar 5 faltas como jogador E como tecnico.
+  const faltasComoJogador = contar(
+    ["P", "P2", "U", "U2", "T", "D", "F", "C", "B"],
+    { semCirculo: true },
+  );
+  const tPlayer = contar(["T"]);
+  const uPlayer = contar(["U", "U2"]);
+  // Faltas como tecnico (C/B). marcador_circulo nao conta.
+  const cCoach = contar(["C"], { semCirculo: true });
+  const bCoach = contar(["B"], { semCirculo: true });
+  const playerTU = tPlayer + uPlayer;
+  // Matriz B.8.3.7 / OBRI 36-27 — GD automatico do jogador-tecnico.
+  const gdAutomatico =
+    playerTU >= 2 ||
+    cCoach >= 2 ||
+    bCoach >= 3 ||
+    (cCoach >= 1 && playerTU >= 1) ||
+    (bCoach >= 2 && playerTU >= 1) ||
+    (cCoach >= 1 && bCoach >= 2);
+  return {
+    faltasComoJogador,
+    excluidoComoJogador: faltasComoJogador >= FALTAS_PESSOAIS_LIMITE,
+    tPlayer,
+    uPlayer,
+    cCoach,
+    bCoach,
+    gdAutomatico,
+  };
+};
+
+// FIBA Art. 37 — herança de cargo na cascata B2.
+// Retorna { tecnico_id, role } para o evento sintetico.
+// principal disponivel → principal; senao assistente; senao capitao (jogador).
+const resolverResponsavelCascata = (sumula, equipe, eventos) => {
+  const { principal, assistente } = obterComissaoMembros(sumula, equipe);
+  const lista = equipe === "A" ? sumula.jogadores_a : sumula.jogadores_b;
+  // FIBA Art. 7.9 — jogador-tecnico ATIVO (original ou 2o capitao sucessor).
+  // Ele segue sendo o tecnico do time esteja em quadra ou no banco: a cascata
+  // B2 cai nele (categoria "tecnico" + jogador_id) ate ser desqualificado. So
+  // entao herda pro proximo (assistente/capitao/sucessor — Art. 37). Usar a
+  // flag jogador_tecnico (e nao so o atleta_id da comissao) garante que, apos a
+  // expulsao do titular, a cascata va pro 2o CAP mesmo que ele nao esteja em
+  // quadra.
+  const jtAtivo = acharJogadorTecnicoAtivo(lista);
+  if (jtAtivo && !jtAtivo.desqualificado) {
+    return { jogador_id: jtAtivo.atleta_id, role: "jogador_tecnico" };
+  }
+  const principalId = principal?.tecnico_id
+    ? String(principal.tecnico_id)
+    : null;
+  const assistenteId = assistente?.tecnico_id
+    ? String(assistente.tecnico_id)
+    : null;
+  const status = calcularStatusComissao(
+    eventos,
+    equipe,
+    principalId,
+    assistenteId,
+  );
+  if (principalId && !status.tecnicoFora) {
+    return { tecnico_id: principalId, role: "principal" };
+  }
+  if (assistenteId && !status.assistenteFora) {
+    return { tecnico_id: assistenteId, role: "assistente" };
+  }
+  // Capitao em quadra como ultimo recurso (Art. 37). Atribui ao jogador_id
+  // como falta B (pessoal nao conta — B nao esta em FALTAS_PESSOAIS).
+  const capitao = (lista || []).find(
+    (j) => j.capitao && (j.em_quadra ?? j.titular) && !j.excluido && !j.desqualificado,
+  );
+  if (capitao) {
+    // FIBA Art. 7.9 — se o capitao e o jogador-tecnico, a cascata B2 e uma
+    // falta de tecnico (categoria "tecnico") e conta no GD dele. Capitao
+    // comum que assume so como ultimo recurso recebe B como jogador_quadra.
+    return {
+      jogador_id: capitao.atleta_id,
+      role: capitao.jogador_tecnico ? "jogador_tecnico" : "capitao",
+    };
+  }
+  // Fallback: sem ninguem disponivel — registra contra principal mesmo
+  // assim para preservar trilha de auditoria.
+  return { tecnico_id: principalId, role: "principal_fallback" };
+};
+
+// FIBA Art. 7.9 / B.8.3.7 — apos uma cascata B2 cair no jogador-tecnico,
+// reavalia a matriz de GD combinada e persiste a desqualificacao. Re-le os
+// eventos do banco para incluir a B2 recem-criada.
+const aplicarGdCascataJogadorTecnico = async (sumula, equipe, alvo) => {
+  if (alvo?.role !== "jogador_tecnico" || !alvo.jogador_id) return;
+  const lista = equipe === "A" ? sumula.jogadores_a : sumula.jogadores_b;
+  const jt = (lista || []).find(
+    (j) => j.atleta_id.toString() === String(alvo.jogador_id),
+  );
+  if (!jt || jt.desqualificado) return;
+  const eventos = await EventoSumula.find({
+    sumula_id: sumula._id,
+    cancelado: false,
+  });
+  const st = calcularStatusJogadorTecnico(eventos, equipe, alvo.jogador_id);
+  if (st && st.gdAutomatico) {
+    jt.desqualificado = true;
+    await sumula.save();
+  }
+};
+
+// computarEstado foi movido para services/sumulaEstadoService.js (importado no
+// topo) para ser reutilizado pela visão pública ao vivo.
 
 const popularSumula = (sumula) =>
   sumula.populate([
@@ -116,6 +300,49 @@ const montarRespostaSumula = async (sumula) => {
   await popularSumula(sumula);
   const estado = await computarEstado(sumula._id);
   const eventos = estado.eventos.map((e) => e.toObject());
+  // Status da comissao tecnica por equipe (FIBA Art. 38.2.4).
+  const statusComissao = {};
+  // Status do jogador-tecnico por equipe (FIBA Art. 7.9 / B.8.3.7).
+  const statusJogadorTecnico = {};
+  for (const eq of ["A", "B"]) {
+    const { principal, assistente } = obterComissaoMembros(sumula, eq);
+    const principalId = principal?.tecnico_id ? String(principal.tecnico_id) : null;
+    const assistenteId = assistente?.tecnico_id
+      ? String(assistente.tecnico_id)
+      : null;
+    statusComissao[eq] = calcularStatusComissao(
+      estado.eventos,
+      eq,
+      principalId,
+      assistenteId,
+    );
+    const lista = eq === "A" ? sumula.jogadores_a : sumula.jogadores_b;
+    const jt = acharJogadorTecnicoAtivo(lista);
+    if (jt) {
+      const jtId = jt.atleta_id?._id || jt.atleta_id;
+      statusJogadorTecnico[eq] = {
+        atleta_id: String(jtId),
+        ...calcularStatusJogadorTecnico(estado.eventos, eq, jtId),
+      };
+    }
+  }
+
+  // Visão pública ao vivo: enquanto o jogo roda, persiste o placar no Jogo
+  // (para os cards da home) e empurra o estado dinâmico aos viewers via SSE.
+  // Só dispara quando a súmula está em andamento — leituras pós-jogo não emitem.
+  if (sumula.status === "em_andamento") {
+    const jogoId = sumula.jogo_id?._id || sumula.jogo_id;
+    try {
+      await Jogo.findByIdAndUpdate(jogoId, {
+        placar_a: estado.placar.A,
+        placar_b: estado.placar.B,
+      });
+      aoVivoBus.publicar(String(jogoId), montarDinamicoAoVivo(sumula, estado));
+    } catch (e) {
+      console.error("[aovivo] emit:", e.message);
+    }
+  }
+
   return {
     sumula: sumula.toObject(),
     estado: {
@@ -125,6 +352,8 @@ const montarRespostaSumula = async (sumula) => {
       timeouts: estado.timeouts,
       faltas_jogador: estado.faltas_jogador,
       pontos_jogador: estado.pontos_jogador,
+      comissao_status: statusComissao,
+      jogador_tecnico_status: statusJogadorTecnico,
     },
     eventos,
   };
@@ -461,9 +690,12 @@ export const patchNumeracao = async (req, res) => {
       }
       const mapa = new Map();
       for (const item of entrada) {
-        if (!item.atleta_id || item.numero === undefined || item.numero === null) {
+        if (!item.atleta_id) {
           throw new Error(`Entrada invalida em jogadores_${label}`);
         }
+        // Numero null/ausente = atleta escalado sem numero (chegou atrasado).
+        // Permitido na Etapa 2; recebe numero durante o jogo.
+        if (item.numero === undefined || item.numero === null) continue;
         if (
           !Number.isInteger(item.numero) ||
           item.numero < 0 ||
@@ -482,10 +714,13 @@ export const patchNumeracao = async (req, res) => {
         );
         if (!entry) {
           throw new Error(
-            `Atleta ${jog.atleta_id} sem numero atribuido (${label})`
+            `Atleta ${jog.atleta_id} sem entrada na numeracao (${label})`
           );
         }
-        jog.numero = entry.numero;
+        jog.numero =
+          entry.numero === undefined || entry.numero === null
+            ? null
+            : entry.numero;
       }
     };
 
@@ -539,9 +774,29 @@ export const patchTitulares = async (req, res) => {
           `capitao_${label} precisa pertencer a escalacao da equipe`
         );
       }
+      // FIBA Art. 7.9 — o jogador-tecnico atua como capitao. Se a equipe usa
+      // jogador-tecnico, ele tem que ser o capitao escolhido.
+      const jt = lista.find((j) => j.jogador_tecnico);
+      if (jt && jt.atleta_id.toString() !== capitaoStr) {
+        throw new Error(
+          `capitao_${label}: o jogador-tecnico precisa ser o capitao (FIBA Art. 7.9)`
+        );
+      }
+      const semNumero = (j) => j.numero === null || j.numero === undefined;
       for (const jog of lista) {
         const atletaIdStr = jog.atleta_id.toString();
         const ehTitular = setIds.has(atletaIdStr);
+        // Atleta sem numero (chegou atrasado) nao pode ser titular nem capitao.
+        if (ehTitular && semNumero(jog)) {
+          throw new Error(
+            `titulares_${label}: atleta sem numero de camisa nao pode ser titular`
+          );
+        }
+        if (atletaIdStr === capitaoStr && semNumero(jog)) {
+          throw new Error(
+            `capitao_${label}: capitao precisa ter numero de camisa`
+          );
+        }
         jog.titular = ehTitular;
         // em_quadra espelha titular no início do jogo — a partir daí passa a
         // ser mutado pelas substituições, deixando titular imutável.
@@ -583,13 +838,24 @@ export const patchTitulares = async (req, res) => {
 // --- ETAPA 3.5: COMISSAO TECNICA (tecnico + assistente por equipe) ---
 export const patchComissao = async (req, res) => {
   const { id } = req.params;
-  const { equipe, tecnico_id, assistente_id } = req.body;
+  const { equipe, tecnico_id, assistente_id, jogador_tecnico_atleta_id } =
+    req.body;
   try {
     if (!["A", "B"].includes(equipe)) {
       return res.status(400).json({ message: "equipe deve ser 'A' ou 'B'" });
     }
-    if (!tecnico_id) {
-      return res.status(400).json({ message: "tecnico_id obrigatorio" });
+    // FIBA B.4.2 — ou a equipe tem tecnico inscrito, ou usa jogador-tecnico.
+    // Nunca os dois ao mesmo tempo.
+    if (!tecnico_id && !jogador_tecnico_atleta_id) {
+      return res.status(400).json({
+        message: "tecnico_id ou jogador_tecnico_atleta_id obrigatorio",
+      });
+    }
+    if (tecnico_id && jogador_tecnico_atleta_id) {
+      return res.status(400).json({
+        message:
+          "Equipe nao pode ter tecnico e jogador-tecnico ao mesmo tempo (FIBA B.4.2)",
+      });
     }
 
     const sumula = await Sumula.findById(id);
@@ -601,40 +867,79 @@ export const patchComissao = async (req, res) => {
     }
 
     const equipeId = equipe === "A" ? sumula.equipe_a_id : sumula.equipe_b_id;
-    const tecnico = await Tecnico.findById(tecnico_id);
-    if (!tecnico || tecnico.is_assistente) {
-      return res.status(400).json({ message: "Tecnico invalido" });
-    }
-    if (tecnico.equipe_id.toString() !== equipeId.toString()) {
-      return res
-        .status(400)
-        .json({ message: "Tecnico nao pertence a esta equipe" });
-    }
+    const lista = equipe === "A" ? sumula.jogadores_a : sumula.jogadores_b;
 
-    const membros = [
-      {
-        nome: tecnico.nome,
-        funcao: "Tecnico",
-        tecnico_id: tecnico._id,
-        assinatura_path: tecnico.assinatura_path || null,
-      },
-    ];
+    let membros;
 
-    if (assistente_id) {
-      const assist = await Tecnico.findById(assistente_id);
-      if (!assist || !assist.is_assistente) {
-        return res.status(400).json({ message: "Assistente invalido" });
+    if (jogador_tecnico_atleta_id) {
+      // FIBA Art. 7.9 / B.4.2 — capitao atua como jogador-tecnico. O atleta
+      // precisa estar na escalacao; vira ComissaoMembro com atleta_id e a
+      // flag jogador_tecnico e espelhada no JogadorSumula correspondente.
+      const jtId = jogador_tecnico_atleta_id.toString();
+      const jog = lista.find((j) => j.atleta_id.toString() === jtId);
+      if (!jog) {
+        return res.status(400).json({
+          message: "Jogador-tecnico precisa estar na escalacao da equipe",
+        });
       }
-      if (assist.equipe_id.toString() !== equipeId.toString()) {
+      const atleta = await Atleta.findById(jtId);
+      if (!atleta) {
+        return res.status(404).json({ message: "Atleta nao encontrado" });
+      }
+      membros = [
+        {
+          nome: atleta.nome_completo,
+          funcao: "Jogador-Tecnico",
+          tecnico_id: null,
+          atleta_id: atleta._id,
+          assinatura_path: null,
+        },
+      ];
+      lista.forEach((j) => {
+        j.jogador_tecnico = j.atleta_id.toString() === jtId;
+      });
+    } else {
+      const tecnico = await Tecnico.findById(tecnico_id);
+      if (!tecnico || tecnico.is_assistente) {
+        return res.status(400).json({ message: "Tecnico invalido" });
+      }
+      if (tecnico.equipe_id.toString() !== equipeId.toString()) {
         return res
           .status(400)
-          .json({ message: "Assistente nao pertence a esta equipe" });
+          .json({ message: "Tecnico nao pertence a esta equipe" });
       }
-      membros.push({
-        nome: assist.nome,
-        funcao: "1o Assistente Tecnico",
-        tecnico_id: assist._id,
-        assinatura_path: null,
+
+      membros = [
+        {
+          nome: tecnico.nome,
+          funcao: "Tecnico",
+          tecnico_id: tecnico._id,
+          atleta_id: null,
+          assinatura_path: tecnico.assinatura_path || null,
+        },
+      ];
+
+      if (assistente_id) {
+        const assist = await Tecnico.findById(assistente_id);
+        if (!assist || !assist.is_assistente) {
+          return res.status(400).json({ message: "Assistente invalido" });
+        }
+        if (assist.equipe_id.toString() !== equipeId.toString()) {
+          return res
+            .status(400)
+            .json({ message: "Assistente nao pertence a esta equipe" });
+        }
+        membros.push({
+          nome: assist.nome,
+          funcao: "1o Assistente Tecnico",
+          tecnico_id: assist._id,
+          atleta_id: null,
+          assinatura_path: null,
+        });
+      }
+      // Equipe deixou de usar jogador-tecnico (re-configuracao): limpa flags.
+      lista.forEach((j) => {
+        j.jogador_tecnico = false;
       });
     }
 
@@ -675,16 +980,19 @@ export const iniciarSumula = async (req, res) => {
       }
     }
 
-    const faltamNumeroA = sumula.jogadores_a.some(
-      (j) => j.numero === null || j.numero === undefined
-    );
-    const faltamNumeroB = sumula.jogadores_b.some(
-      (j) => j.numero === null || j.numero === undefined
-    );
-    if (faltamNumeroA || faltamNumeroB) {
+    // Atletas sem numero sao permitidos na escalacao (chegaram atrasados) —
+    // recebem numero durante o jogo. So titulares e capitao exigem numero.
+    const semNumero = (j) => j.numero === null || j.numero === undefined;
+    const titularSemNumero =
+      sumula.jogadores_a.some((j) => j.titular && semNumero(j)) ||
+      sumula.jogadores_b.some((j) => j.titular && semNumero(j));
+    const capitaoSemNumero =
+      sumula.jogadores_a.some((j) => j.capitao && semNumero(j)) ||
+      sumula.jogadores_b.some((j) => j.capitao && semNumero(j));
+    if (titularSemNumero || capitaoSemNumero) {
       return res
         .status(400)
-        .json({ message: "Etapa 2 incompleta: atletas sem numero de camisa" });
+        .json({ message: "Titular/capitao sem numero de camisa" });
     }
 
     const titularesA = sumula.jogadores_a.filter((j) => j.titular).length;
@@ -741,7 +1049,6 @@ export const registrarEvento = async (req, res) => {
     jogador_entra_id,
     jogador_sai_id,
     minuto_jogo,
-    ultimos_2min_q4,
   } = req.body;
   try {
     const sumula = await Sumula.findById(id);
@@ -798,10 +1105,14 @@ export const registrarEvento = async (req, res) => {
       // eh enviada pelo frontend; legado (null) cai em validacao mais permissiva.
       const cat = req.body.categoria_pessoa || null;
       const TIPOS_POR_CATEGORIA = {
-        jogador_quadra: ["P", "T", "U", "D"],
+        jogador_quadra: ["P", "T", "U", "D", "F"],
         substituto: ["D"],
-        excluido: ["B"],
-        tecnico: ["C", "B", "D"],
+        // FIBA B.8.3.11 / Art. 36 — jogador excluido pode receber D
+        // (cascateia B no tecnico principal). B continua valido (regra 40.3).
+        excluido: ["B", "D"],
+        // FIBA Art. 39 — tecnico que entra na briga e nao acalma recebe D2
+        // + F nos espacos restantes.
+        tecnico: ["C", "B", "D", "F"],
         assistente: ["D"],
       };
       if (cat && TIPOS_POR_CATEGORIA[cat]) {
@@ -810,6 +1121,52 @@ export const registrarEvento = async (req, res) => {
             message: `tipo_falta '${tipo_falta}' nao permitido para categoria '${cat}' (FIBA)`,
           });
         }
+      }
+      // Validacao tipo↔LL (FIBA Sec. 8 — bloqueios):
+      //   T, C, B (input direto) → LL=1; cancelada → LL=0.
+      //   B com LL=2 (B2) so via cascata sintetica (cascata_de preenchido).
+      //   U, D em jogador_quadra → LL ∈ {1,2,3}.
+      //   D em substituto/assistente/excluido (direto) → LL=0 (sem numero).
+      //   F → LL=0 (Art. 39 / B.8.3.14).
+      //   P → LL ∈ {0,1,2,3} livre.
+      const ehCancelada = req.body.cancelada_manual === true;
+      const ll = lances_livres == null ? 0 : Number(lances_livres);
+      const validarLL = (permitidos) => {
+        if (!permitidos.includes(ll)) {
+          return res.status(400).json({
+            message: `lances_livres=${ll} invalido para tipo_falta '${tipo_falta}' (FIBA permite ${permitidos.join("/")})`,
+          });
+        }
+        return null;
+      };
+      if (ehCancelada) {
+        // Qualquer tipo cancelado deve zerar LL.
+        if (ll !== 0) {
+          return res.status(400).json({
+            message: "falta cancelada (cancelada_manual=true) deve ter lances_livres=0",
+          });
+        }
+      } else if (tipo_falta === "T" || tipo_falta === "C") {
+        const err = validarLL([1]);
+        if (err) return err;
+      } else if (tipo_falta === "B") {
+        // B direto (input do mesario) → LL=1. B2 (LL=2) so via cascata.
+        const ehCascata = !!req.body.cascata_de;
+        const permitidos = ehCascata ? [1, 2] : [1];
+        const err = validarLL(permitidos);
+        if (err) return err;
+      } else if (tipo_falta === "U") {
+        const err = validarLL([1, 2, 3]);
+        if (err) return err;
+      } else if (tipo_falta === "D") {
+        const semNumero =
+          cat === "substituto" || cat === "assistente" || cat === "excluido";
+        const permitidos = semNumero ? [0] : [1, 2, 3];
+        const err = validarLL(permitidos);
+        if (err) return err;
+      } else if (tipo_falta === "F") {
+        const err = validarLL([0]);
+        if (err) return err;
       }
       const ehFaltaTecnico =
         (tipo_falta === "C" || tipo_falta === "B" || tipo_falta === "D") &&
@@ -820,9 +1177,26 @@ export const registrarEvento = async (req, res) => {
         if (!jogador) {
           return res.status(400).json({ message: "jogador nao pertence a equipe" });
         }
-        // FIBA: jogador excluido/desqualificado ainda pode receber faltas
-        // (ex.: tecnica do banco aplicada nele apos sair). So validamos que
-        // pertence a equipe.
+        // FIBA Art. 38 — jogador desqualificado (GD) deixa o ginasio e nao
+        // recebe mais faltas. Excluido (5 faltas) ainda pode receber D
+        // (cascateia B2 no tecnico — categoria=excluido).
+        if (jogador.desqualificado) {
+          return res.status(400).json({
+            message: "atleta ja desqualificado (GD) — deveria ter deixado o ginasio. Nao recebe mais faltas.",
+          });
+        }
+        // FIBA Art. 7.9 — falta como tecnico (C/B) atribuida a um jogador_id
+        // so e valida quando esse jogador e o jogador-tecnico da equipe.
+        if (
+          (tipo_falta === "C" || tipo_falta === "B") &&
+          cat === "tecnico" &&
+          !jogador.jogador_tecnico
+        ) {
+          return res.status(400).json({
+            message:
+              "falta C/B so pode ser atribuida a um tecnico ou ao jogador-tecnico",
+          });
+        }
       } else {
         const comissao = equipe === "A" ? sumula.comissao_a : sumula.comissao_b;
         const pertence = (comissao || []).some(
@@ -832,39 +1206,86 @@ export const registrarEvento = async (req, res) => {
         if (!pertence) {
           return res.status(400).json({ message: "tecnico nao pertence a comissao" });
         }
+        // FIBA Art. 38.2.4 — tecnico/assistente ja desqualificado nao recebe
+        // mais faltas diretas do mesario. Cascata B2 (req.body.cascata_de) ja
+        // contorna isso via resolverResponsavelCascata (Art. 37: principal →
+        // assistente → capitao). Bloqueio so aplica a input direto.
+        if (!req.body.cascata_de) {
+          const { principal, assistente } = obterComissaoMembros(sumula, equipe);
+          const principalId = principal?.tecnico_id ? String(principal.tecnico_id) : null;
+          const assistenteId = assistente?.tecnico_id ? String(assistente.tecnico_id) : null;
+          const status = calcularStatusComissao(
+            estado.eventos,
+            equipe,
+            principalId,
+            assistenteId,
+          );
+          const alvoStr = String(req.body.tecnico_id);
+          if (alvoStr === principalId && status.tecnicoFora) {
+            return res.status(400).json({
+              message: "tecnico ja desqualificado (Art. 38.2.4) — nao recebe mais faltas; B2 cascateia para 1o assistente ou capitao",
+            });
+          }
+          if (alvoStr === assistenteId && status.assistenteFora) {
+            return res.status(400).json({
+              message: "1o assistente ja desqualificado — nao recebe mais faltas",
+            });
+          }
+        }
       }
     }
 
     if (tipo === "timeout") {
-      const metade =
-        sumula.quarto_atual <= QUARTO_FIM_PRIMEIRA_METADE ? "primeira" : "segunda";
-      let limite = limiteTimeoutsMetade(metade);
-      // FIBA: no Q3 so sao permitidos 2 TOs — o 3o da 2a metade fica reservado
-      // para o Q4.
-      if (metade === "segunda" && sumula.quarto_atual < QUARTO_FINAL) {
-        limite = 2;
-      }
-      // FIBA: bonus de +1 TO nos ultimos 2 minutos do Q4.
-      const podeBonus =
-        ultimos_2min_q4 === true && sumula.quarto_atual === QUARTO_FINAL;
-      if (podeBonus) {
-        limite += TIMEOUTS_BONUS_ULTIMOS_2MIN;
-      }
-      if (estado.timeouts[equipe][metade] >= limite) {
-        return res.status(400).json({
-          message: `Limite de timeouts atingido na ${metade} metade (max ${limite})`,
-        });
-      }
+      const ehOT = sumula.quarto_atual > QUARTO_FINAL;
       if (minuto_jogo === undefined || minuto_jogo === null) {
         return res
           .status(400)
           .json({ message: "minuto_jogo obrigatorio para timeout" });
       }
       const minutoInt = Number(minuto_jogo);
-      if (!Number.isInteger(minutoInt) || minutoInt < 0 || minutoInt > 10) {
-        return res
-          .status(400)
-          .json({ message: "minuto_jogo deve ser inteiro 0-10 (FIBA B.7)" });
+      if (ehOT) {
+        // Prorrogacao dura 5 min — minuto inteiro do quarto vai de 0 a 4.
+        if (!Number.isInteger(minutoInt) || minutoInt < 0 || minutoInt > 4) {
+          return res
+            .status(400)
+            .json({ message: "minuto_jogo na prorrogacao deve ser inteiro 0-4" });
+        }
+        // FIBA: 1 timeout por equipe por prorrogacao.
+        const usadosOT =
+          estado.timeouts[equipe].prorrogacao[sumula.quarto_atual] || 0;
+        if (usadosOT >= 1) {
+          return res.status(400).json({
+            message: "Limite de timeouts da prorrogacao atingido (max 1)",
+          });
+        }
+      } else {
+        if (!Number.isInteger(minutoInt) || minutoInt < 0 || minutoInt > 10) {
+          return res
+            .status(400)
+            .json({ message: "minuto_jogo deve ser inteiro 0-10 (FIBA B.7)" });
+        }
+        const metade =
+          sumula.quarto_atual <= QUARTO_FIM_PRIMEIRA_METADE
+            ? "primeira"
+            : "segunda";
+        let limite = limiteTimeoutsMetade(metade);
+        // FIBA: no Q3 so sao permitidos 2 TOs — o 3o da 2a metade fica
+        // reservado para o Q4.
+        if (metade === "segunda" && sumula.quarto_atual < QUARTO_FINAL) {
+          limite = 2;
+        }
+        // Regra "uso ou perde" (Q4 ultimos 2 min com 3/3): incrementa em 2
+        // (1 sintetico perdido + 1 real). Validar que ha espaco.
+        const acionaPerdido2min =
+          sumula.quarto_atual === QUARTO_FINAL &&
+          minutoInt <= 1 &&
+          estado.timeouts[equipe].segunda === 0;
+        const incremento = acionaPerdido2min ? 2 : 1;
+        if (estado.timeouts[equipe][metade] + incremento > limite) {
+          return res.status(400).json({
+            message: `Limite de timeouts atingido na ${metade} metade (max ${limite})`,
+          });
+        }
       }
     }
 
@@ -914,7 +1335,7 @@ export const registrarEvento = async (req, res) => {
     const ultimaSeq = await EventoSumula.findOne({ sumula_id: sumula._id })
       .sort({ sequencia: -1 })
       .select("sequencia");
-    const proxSeq = (ultimaSeq?.sequencia || 0) + 1;
+    let proxSeq = (ultimaSeq?.sequencia || 0) + 1;
 
     let pontoProgressivo = null;
     if (tipo === "ponto") {
@@ -923,6 +1344,28 @@ export const registrarEvento = async (req, res) => {
         0
       );
       pontoProgressivo = totalPontosAnteriores + valor;
+    }
+
+    // Regra "uso ou perde" — Q4 ultimos 2 min com 3/3: cria evento sintetico
+    // de TO perdido ANTES do TO real. Ambos ocupam slots da segunda metade.
+    if (
+      tipo === "timeout" &&
+      sumula.quarto_atual === QUARTO_FINAL &&
+      Number(minuto_jogo) <= 1 &&
+      estado.timeouts[equipe].segunda === 0
+    ) {
+      await EventoSumula.create({
+        sumula_id: sumula._id,
+        sequencia: proxSeq,
+        quarto: sumula.quarto_atual,
+        tipo: "timeout",
+        equipe,
+        minuto_jogo: null,
+        perdido_2min: true,
+        ip: req.ip,
+        user_agent: req.get("user-agent") || null,
+      });
+      proxSeq += 1;
     }
 
     const evento = await EventoSumula.create({
@@ -962,54 +1405,67 @@ export const registrarEvento = async (req, res) => {
       });
     }
 
-    // Cascata FIBA B.8.3.10: D em substituto/assistente gera B2 contra
-    // tecnico principal. NAO conta como falta de equipe (cascata_de marca).
+    // Cascata FIBA B.8.3.10 / B.8.3.11: D em substituto/assistente/excluido
+    // gera B2 contra tecnico principal (ou herdeiro de cargo, Art. 37).
+    // NAO conta como falta de equipe (cascata_de marca).
+    // SKIP quando subtipo_briga setado — fluxo briga (registrarBriga) cuida
+    // da propria cascata deduplicada por fight_group_id.
     if (
       tipo === "falta" &&
       tipo_falta === "D" &&
+      !req.body.subtipo_briga &&
       (req.body.categoria_pessoa === "substituto" ||
-        req.body.categoria_pessoa === "assistente")
+        req.body.categoria_pessoa === "assistente" ||
+        req.body.categoria_pessoa === "excluido")
     ) {
-      const comissao = equipe === "A" ? sumula.comissao_a : sumula.comissao_b;
-      const principal = (comissao || []).find((m) => {
-        const fn = (m.funcao || "").toLowerCase();
-        return /tecnico/.test(fn) && !/assist/.test(fn);
-      });
-      if (principal && principal.tecnico_id) {
-        const seqB2 = proxSeq + 0.5; // entre o evento atual e o proximo
+      // Inclui o evento recem-criado na lista para que o calculo de
+      // herança considere o D que acabou de cair (afeta assistenteD).
+      const eventosBase = [...estado.eventos, evento];
+      const alvo = resolverResponsavelCascata(sumula, equipe, eventosBase);
+      const seqB2 = proxSeq + 0.5; // entre o evento atual e o proximo
+      const baseB2 = {
+        sumula_id: sumula._id,
+        sequencia: seqB2,
+        quarto: sumula.quarto_atual,
+        tipo: "falta",
+        equipe,
+        tipo_falta: "B",
+        lances_livres: 2,
+        categoria_pessoa:
+          alvo.role === "capitao" ? "jogador_quadra" : "tecnico",
+        cascata_de: evento._id,
+        ip: req.ip,
+        user_agent: req.get("user-agent") || null,
+      };
+      if (alvo.tecnico_id) {
         await EventoSumula.create({
-          sumula_id: sumula._id,
-          sequencia: seqB2,
-          quarto: sumula.quarto_atual,
-          tipo: "falta",
-          equipe,
+          ...baseB2,
           jogador_id: null,
-          tecnico_id: principal.tecnico_id,
-          tipo_falta: "B",
-          lances_livres: 2,
-          categoria_pessoa: "tecnico",
-          cascata_de: evento._id,
-          ip: req.ip,
-          user_agent: req.get("user-agent") || null,
+          tecnico_id: alvo.tecnico_id,
+        });
+      } else if (alvo.jogador_id) {
+        await EventoSumula.create({
+          ...baseB2,
+          jogador_id: alvo.jogador_id,
+          tecnico_id: null,
         });
       }
+      await aplicarGdCascataJogadorTecnico(sumula, equipe, alvo);
     }
 
     if (tipo === "falta" && jogador_id) {
       const jogador = findJogadorEmSumula(sumula, equipe, jogador_id);
-      // Faltas que contam como pessoal do atleta (FIBA B.8.3): P, U, D, T.
-      // C (Coach) e B (Banco) sao contadas contra o tecnico, nao contra o jogador.
-      const contaComoPessoal = ["P", "P2", "U", "U2", "T", "D"].includes(
-        tipo_falta
-      );
-      if (contaComoPessoal) {
-        jogador.faltas += 1;
-        if (jogador.faltas >= FALTAS_PESSOAIS_LIMITE) {
-          jogador.excluido = true;
-        }
-      }
+      // jogador.faltas NAO e incremental — e recomputado a partir dos eventos
+      // ativos a cada falta. Isso elimina o drift de contagem que aparecia ao
+      // desfazer/refazer faltas (register +1 / cancel -1 podiam dessincronizar).
+      // computarEstado conta P/T/U/D/F + C/B do jogador-tecnico (OBRI 36-33).
+      const estadoPosFalta = await computarEstado(sumula._id);
+      jogador.faltas =
+        estadoPosFalta.faltas_jogador[jogador_id.toString()] || 0;
+      jogador.excluido = jogador.faltas >= FALTAS_PESSOAIS_LIMITE;
       // Auto-deteccao de desqualificacao (GD) do jogador.
-      if (tipo_falta === "D" || tipo_falta === "U2") {
+      // F (briga, Art. 39) tambem causa desqualificacao imediata.
+      if (tipo_falta === "D" || tipo_falta === "U2" || tipo_falta === "F") {
         jogador.desqualificado = true;
       }
       if (tipo_falta === "U") {
@@ -1051,6 +1507,20 @@ export const registrarEvento = async (req, res) => {
         const novaT = tipo_falta === "T";
         const novaU = tipo_falta === "U";
         if ((temT && novaU) || (temU && novaT)) {
+          jogador.desqualificado = true;
+        }
+      }
+      // FIBA Art. 7.9 / B.8.3.7 / OBRI 36-27 — jogador-tecnico: combina faltas
+      // como jogador (T/U) com faltas como tecnico (C/B) na matriz de GD
+      // automatico. Cobre combinacoes que o bloco acima (so jogador) nao pega,
+      // como 1 C + 1 T.
+      if (jogador.jogador_tecnico && !jogador.desqualificado) {
+        const st = calcularStatusJogadorTecnico(
+          [...estado.eventos, evento],
+          equipe,
+          jogador_id,
+        );
+        if (st && st.gdAutomatico) {
           jogador.desqualificado = true;
         }
       }
@@ -1104,6 +1574,590 @@ export const registrarEvento = async (req, res) => {
   }
 };
 
+// --- REGISTRAR BRIGA (FIBA B.8.3.14 / B.8.3.15) ---
+// Cria de uma vez todos os eventos derivados de uma briga: D ou D2 em cada
+// envolvido + UNICA cascata B2 no tecnico principal (deduplicada por
+// fight_group_id). Na mesma partida pode haver varias brigas (cada uma um
+// novo group). Mesma briga pode receber novos envolvidos (envia
+// fight_group_id existente — nova B2 NAO eh criada).
+//
+// Body: {
+//   equipe: "A"|"B",
+//   envolvidos: [{
+//     atleta_id?, tecnico_id?,
+//     categoria: "jogador_quadra"|"substituto"|"excluido"|"tecnico"|"assistente",
+//     subtipo: "invasao"|"envolvimento_ativo"  // por envolvido — mesma briga
+//                                                pode misturar sub que invadiu
+//                                                sem brigar (D) e sub que
+//                                                invadiu E brigou (D2).
+//   }],
+//   delegacao_count?: number,
+//   delegacao_subtipo?: "invasao"|"envolvimento_ativo",  // obrigatorio se count>0
+//   fight_group_id?: string  // omitido = nova briga; setado = adiciona a briga existente
+// }
+//
+// Letras geradas (por envolvido):
+//   invasao  + jogador_quadra/substituto/excluido/assistente → D (sem numero)
+//   invasao  + tecnico (saiu do banco)                      → D2
+//   envolvimento_ativo + qualquer envolvido                  → D2
+// Cascata UNICA B2 (LL=2) no tec. principal — mesma briga = mesma B2.
+// PDF preenche F nos slots restantes do envolvido (auto via subtipo_briga).
+export const registrarBriga = async (req, res) => {
+  const { id } = req.params;
+  const {
+    equipe,
+    envolvidos,
+    fight_group_id: groupIdEntrada,
+    delegacao_count: delegacaoCountRaw,
+    delegacao_subtipo: delegacaoSubtipo,
+  } = req.body || {};
+  try {
+    if (!["A", "B"].includes(equipe)) {
+      return res.status(400).json({ message: "equipe invalida" });
+    }
+    const delegacaoCount = Number.isFinite(Number(delegacaoCountRaw))
+      ? Math.max(0, Math.floor(Number(delegacaoCountRaw)))
+      : 0;
+    if (
+      delegacaoCount > 0 &&
+      !["invasao", "envolvimento_ativo"].includes(delegacaoSubtipo)
+    ) {
+      return res.status(400).json({
+        message: "delegacao_subtipo obrigatorio (invasao|envolvimento_ativo) quando delegacao_count > 0",
+      });
+    }
+    const envolvidosArr = Array.isArray(envolvidos) ? envolvidos : [];
+    if (envolvidosArr.length === 0 && delegacaoCount === 0) {
+      return res.status(400).json({
+        message: "briga requer pelo menos 1 envolvido OU 1 delegacao",
+      });
+    }
+    const sumula = await Sumula.findById(id);
+    if (!sumula) return res.status(404).json({ message: "Sumula nao encontrada" });
+    if (sumula.status !== "em_andamento") {
+      return res.status(400).json({ message: "Sumula nao esta em andamento" });
+    }
+
+    // Resolve tecnico principal — alvo natural da cascata B2. Para a herança
+    // de cargo (Art. 37 — usado quando principal ja esta fora) chamamos
+    // resolverResponsavelCascata mais abaixo, apos criar os eventos da briga,
+    // para que o calculo considere o estado atualizado.
+    const { principal } = obterComissaoMembros(sumula, equipe);
+    const principalId = principal?.tecnico_id ? String(principal.tecnico_id) : null;
+    // FIBA Art. 7.9 — quando o tecnico principal e um jogador-tecnico, ele e
+    // identificado por atleta_id (nao tecnico_id). Usado pra detectar
+    // principal-envolvido e deduplicar a cascata B2.
+    const principalAtletaId = principal?.atleta_id
+      ? String(principal.atleta_id)
+      : null;
+
+    // Fight group: reusa se passado (briga existente), cria novo se omitido.
+    const fight_group_id = groupIdEntrada
+      ? new mongoose.Types.ObjectId(groupIdEntrada)
+      : new mongoose.Types.ObjectId();
+
+    // Valida envolvidos (categoria + subtipo + atleta_id/tecnico_id).
+    // Bloqueia jogador ja desqualificado (FIBA: deveria ter deixado o ginasio
+    // — incidentes com ele sao ata extra, nao briga regular).
+    let tecnicoPrincipalEnvolvido = false;
+    for (const env of envolvidosArr) {
+      if (
+        !["jogador_quadra", "substituto", "excluido", "tecnico", "assistente"].includes(
+          env.categoria,
+        )
+      ) {
+        return res
+          .status(400)
+          .json({ message: `categoria invalida: ${env.categoria}` });
+      }
+      if (!["invasao", "envolvimento_ativo"].includes(env.subtipo)) {
+        return res.status(400).json({
+          message: "envolvido requer subtipo (invasao|envolvimento_ativo)",
+        });
+      }
+      // FIBA Art. 7.9 — jogador-tecnico envolvido na briga enquanto esta no
+      // banco atua como COACH: enviado com categoria "tecnico" + atleta_id (sem
+      // tecnico_id, pois e um atleta do roster). D/D2 vai pra linha do tecnico
+      // (categoria "tecnico" + jogador_id) e espelha na linha de jogador dele.
+      const ehJTCoach =
+        env.categoria === "tecnico" && env.atleta_id && !env.tecnico_id;
+      if (ehJTCoach) {
+        const jogador = findJogadorEmSumula(sumula, equipe, env.atleta_id);
+        if (!jogador) {
+          return res
+            .status(400)
+            .json({ message: "atleta nao pertence a equipe" });
+        }
+        if (!jogador.jogador_tecnico) {
+          return res.status(400).json({
+            message:
+              "categoria 'tecnico' com atleta_id so e valida para jogador-tecnico",
+          });
+        }
+        if (jogador.desqualificado) {
+          return res.status(400).json({
+            message: `jogador-tecnico ${env.atleta_id} ja desqualificado — deveria ter deixado o ginasio.`,
+          });
+        }
+        if (principalAtletaId && String(env.atleta_id) === principalAtletaId) {
+          tecnicoPrincipalEnvolvido = true;
+        }
+      } else if (env.categoria === "tecnico" || env.categoria === "assistente") {
+        if (!env.tecnico_id) {
+          return res.status(400).json({
+            message: "tecnico/assistente envolvido requer tecnico_id",
+          });
+        }
+        if (env.categoria === "tecnico" && String(env.tecnico_id) === principalId) {
+          tecnicoPrincipalEnvolvido = true;
+        }
+      } else {
+        if (!env.atleta_id) {
+          return res.status(400).json({
+            message: `${env.categoria} envolvido requer atleta_id`,
+          });
+        }
+        const jogador = findJogadorEmSumula(sumula, equipe, env.atleta_id);
+        if (jogador?.desqualificado) {
+          return res.status(400).json({
+            message: `atleta ${env.atleta_id} ja desqualificado — deveria ter deixado o ginasio. Reportar ao evento.`,
+          });
+        }
+      }
+    }
+
+    const ultimaSeq = await EventoSumula.findOne({ sumula_id: sumula._id })
+      .sort({ sequencia: -1 })
+      .select("sequencia");
+    let proxSeq = (ultimaSeq?.sequencia || 0) + 1;
+
+    const eventosCriados = [];
+    for (const env of envolvidosArr) {
+      const ehJTCoach =
+        env.categoria === "tecnico" && env.atleta_id && !env.tecnico_id;
+      // Letra + LL por subtipo+categoria (subtipo agora vem por envolvido).
+      let tipoFalta = "D";
+      let ll;
+      if (ehJTCoach) {
+        // FIBA Art. 7.9 — jogador-tecnico (coach) envolvido na briga: SEMPRE D2.
+        // Nao existe "invasao" pra ele — como tecnico do time pode entrar em
+        // quadra pra separar a briga, entao a anotacao e sempre D2 (LL=2). Os 2
+        // LL ficam na linha do tecnico; a linha de jogador dele espelha so a
+        // letra "D" (PDF suprime o nº — montarSlotsFalta).
+        ll = 2;
+      } else if (env.categoria === "tecnico" || env.categoria === "jogador_quadra") {
+        // Tecnico saindo do banco OU jogador quadra envolvido = D2.
+        ll = 2;
+      } else {
+        // substituto/excluido/assistente: invasao=D sem numero; envolvimento=D2.
+        ll = env.subtipo === "invasao" ? 0 : 2;
+      }
+      const ehAtleta =
+        env.categoria === "jogador_quadra" ||
+        env.categoria === "substituto" ||
+        env.categoria === "excluido";
+      // JT-coach grava jogador_id (linha de jogador espelha o D + F) MAS
+      // categoria "tecnico" (linha Head coach recebe o D/D2 com o nº de LL).
+      const gravaJogadorId = ehAtleta || ehJTCoach;
+      const evento = await EventoSumula.create({
+        sumula_id: sumula._id,
+        sequencia: proxSeq++,
+        quarto: sumula.quarto_atual,
+        tipo: "falta",
+        equipe,
+        jogador_id: gravaJogadorId ? env.atleta_id : null,
+        tecnico_id: gravaJogadorId ? null : env.tecnico_id,
+        categoria_pessoa: env.categoria,
+        tipo_falta: tipoFalta,
+        lances_livres: ll,
+        subtipo_briga: env.subtipo,
+        fight_group_id,
+        ip: req.ip,
+        user_agent: req.get("user-agent") || null,
+      });
+      eventosCriados.push(evento);
+
+      // Atualiza estado do atleta — D em briga conta como pessoal e desqualifica.
+      // JT-coach tambem: a linha de jogador dele mostra D + F, e ele e DQ.
+      if (gravaJogadorId) {
+        const jogador = findJogadorEmSumula(sumula, equipe, env.atleta_id);
+        if (jogador) {
+          jogador.faltas += 1;
+          if (jogador.faltas >= FALTAS_PESSOAIS_LIMITE) {
+            jogador.excluido = true;
+          }
+          jogador.desqualificado = true;
+          jogador.em_quadra = false;
+        }
+      }
+    }
+
+    // Cascata B2 unica por briga (FIBA B.8.3.14/.15). LL=2 sempre — qualquer
+    // briga (invasao OU envolvimento) gera B2 no tec. principal. NAO cria se:
+    //   - briga so tem delegacoes (delegacoes ja geram marcas circuladas
+    //     proprias — nao precisam cascata adicional)
+    //   - tecnico principal ja esta entre envolvidos (D2 dele cobre obrigacao)
+    //   - briga existente ja tem cascata B2 registrada (dedup fight_group_id)
+    //   - sem principal definido na comissao
+    // subtipo_briga da cascata: prioriza envolvimento_ativo se houver algum
+    // (severidade maior); senao invasao.
+    let cascataCriada = null;
+    const temEnvolvidoNaoTecnico = envolvidosArr.length > 0;
+    // FIBA Art. 37 — alvo da cascata existe se ha tecnico principal por
+    // tecnico_id OU por atleta_id (jogador-tecnico).
+    const temPrincipal = !!(principalId || principalAtletaId);
+    if (temPrincipal && !tecnicoPrincipalEnvolvido && temEnvolvidoNaoTecnico) {
+      // FIBA Art. 37 — herança de cargo: se principal ja esta desqualificado,
+      // cascata B2 vai pro 1o assistente; se nao houver, capitao em quadra.
+      // Considera todos os eventos ja existentes + os recem-criados desta briga
+      // (que podem incluir D no proprio principal/assistente/capitao).
+      const eventosBaseHeranca = await EventoSumula.find({
+        sumula_id: sumula._id,
+        cancelado: false,
+      }).sort({ sequencia: 1 });
+      const alvoCascata = resolverResponsavelCascata(
+        sumula,
+        equipe,
+        eventosBaseHeranca,
+      );
+      const jaCascata = await EventoSumula.exists({
+        sumula_id: sumula._id,
+        fight_group_id,
+        tipo_falta: "B",
+        cancelado: false,
+        marcador_circulo: false,
+      });
+      if (!jaCascata) {
+        const subtipoCascata = envolvidosArr.some(
+          (e) => e.subtipo === "envolvimento_ativo",
+        )
+          ? "envolvimento_ativo"
+          : "invasao";
+        const baseCascata = {
+          sumula_id: sumula._id,
+          sequencia: proxSeq++,
+          quarto: sumula.quarto_atual,
+          tipo: "falta",
+          equipe,
+          categoria_pessoa:
+            alvoCascata.role === "capitao" ? "jogador_quadra" : "tecnico",
+          tipo_falta: "B",
+          lances_livres: 2,
+          subtipo_briga: subtipoCascata,
+          fight_group_id,
+          cascata_de: eventosCriados[0]._id,
+          ip: req.ip,
+          user_agent: req.get("user-agent") || null,
+        };
+        if (alvoCascata.tecnico_id) {
+          cascataCriada = await EventoSumula.create({
+            ...baseCascata,
+            tecnico_id: alvoCascata.tecnico_id,
+            jogador_id: null,
+          });
+        } else if (alvoCascata.jogador_id) {
+          cascataCriada = await EventoSumula.create({
+            ...baseCascata,
+            jogador_id: alvoCascata.jogador_id,
+            tecnico_id: null,
+          });
+        }
+        if (cascataCriada) eventosCriados.push(cascataCriada);
+        await aplicarGdCascataJogadorTecnico(sumula, equipe, alvoCascata);
+      }
+    }
+
+    // FIBA B.8.3.13/.14/.15 — membros da delegacao acompanhante: cada
+    // disqualifying foul vira marca CIRCULADA na linha do tecnico principal.
+    // Sempre B2 (LL=2) — qualquer briga (invasao OU envolvimento) = B2.
+    // NAO conta para o limite de 3 tecnicas que dispara GD do tecnico
+    // (calcularStatusComissao filtra marcador_circulo).
+    // Alvo da delegacao = linha do tecnico principal (Head coach). Suporta o
+    // jogador-tecnico (FIBA Art. 7.9): sem tecnico inscrito, a B2 circulada cai
+    // no jogador_id do JT ATIVO (original ou 2o capitao sucessor) com categoria
+    // "tecnico" + marcador_circulo (nao conta GD nem falta de equipe).
+    const listaDelegacao =
+      equipe === "A" ? sumula.jogadores_a : sumula.jogadores_b;
+    const jtAtivoDelegacao = principalId
+      ? null
+      : acharJogadorTecnicoAtivo(listaDelegacao);
+    const delegacaoAlvo = principalId
+      ? { tecnico_id: principalId }
+      : jtAtivoDelegacao && !jtAtivoDelegacao.desqualificado
+        ? { jogador_id: jtAtivoDelegacao.atleta_id }
+        : null;
+    if (delegacaoCount > 0 && delegacaoAlvo) {
+      for (let i = 0; i < delegacaoCount; i++) {
+        const delEv = await EventoSumula.create({
+          sumula_id: sumula._id,
+          sequencia: proxSeq++,
+          quarto: sumula.quarto_atual,
+          tipo: "falta",
+          equipe,
+          tecnico_id: delegacaoAlvo.tecnico_id || null,
+          jogador_id: delegacaoAlvo.jogador_id || null,
+          categoria_pessoa: "tecnico",
+          tipo_falta: "B",
+          lances_livres: 2,
+          subtipo_briga: delegacaoSubtipo,
+          fight_group_id,
+          marcador_circulo: true,
+          ip: req.ip,
+          user_agent: req.get("user-agent") || null,
+        });
+        eventosCriados.push(delEv);
+      }
+    }
+
+    await sumula.save();
+    const resposta = await montarRespostaSumula(sumula);
+    res.status(201).json({
+      fight_group_id: fight_group_id.toString(),
+      eventos: eventosCriados,
+      ...resposta,
+    });
+  } catch (error) {
+    console.error("[sumula] registrarBriga:", error);
+    res
+      .status(500)
+      .json({ message: "Erro ao registrar briga", error: error.message });
+  }
+};
+
+// --- REGISTRAR FALTA DE DELEGAÇÃO ACOMPANHANTE (FIBA B.8.3.13/.14/.15) ---
+// Membro da delegacao acompanhante (nao listado individualmente na sumula)
+// recebe D ou D2 → unica anotacao "B" ou "B2" no tecnico principal com marca
+// de circulo (ⓑ / B₂ circulado). NAO conta para o limite de 3 tecnicas que
+// gera GD do tecnico.
+//
+// Body: {
+//   equipe: "A"|"B",
+//   subtipo: "normal"|"invasao"|"envolvimento_ativo"  // "normal" = falta isolada de delegacao
+// }
+export const registrarFaltaDelegacao = async (req, res) => {
+  const { id } = req.params;
+  const { equipe, subtipo } = req.body || {};
+  try {
+    if (!["A", "B"].includes(equipe)) {
+      return res.status(400).json({ message: "equipe invalida" });
+    }
+    if (!["normal", "invasao", "envolvimento_ativo"].includes(subtipo)) {
+      return res
+        .status(400)
+        .json({ message: "subtipo invalido (normal|invasao|envolvimento_ativo)" });
+    }
+    const sumula = await Sumula.findById(id);
+    if (!sumula) return res.status(404).json({ message: "Sumula nao encontrada" });
+    if (sumula.status !== "em_andamento") {
+      return res.status(400).json({ message: "Sumula nao esta em andamento" });
+    }
+    const { principal } = obterComissaoMembros(sumula, equipe);
+    const principalId = principal?.tecnico_id ? String(principal.tecnico_id) : null;
+    // FIBA Art. 7.9 — sem tecnico inscrito, a B2 circulada cai no jogador_id do
+    // jogador-tecnico ATIVO (original ou 2o capitao sucessor).
+    const listaDel = equipe === "A" ? sumula.jogadores_a : sumula.jogadores_b;
+    const jtDel = principalId ? null : acharJogadorTecnicoAtivo(listaDel);
+    const alvo = principalId
+      ? { tecnico_id: principalId }
+      : jtDel && !jtDel.desqualificado
+        ? { jogador_id: jtDel.atleta_id }
+        : null;
+    if (!alvo) {
+      return res
+        .status(400)
+        .json({ message: "tecnico principal nao definido na comissao" });
+    }
+    const ultimaSeq = await EventoSumula.findOne({ sumula_id: sumula._id })
+      .sort({ sequencia: -1 })
+      .select("sequencia");
+    const proxSeq = (ultimaSeq?.sequencia || 0) + 1;
+    // LL: normal=2 (B2 padrao para delegacao), invasao=2, envolvimento=2.
+    // Sempre B2 com circulo conforme exemplos B.8.3.14/.15.
+    const evento = await EventoSumula.create({
+      sumula_id: sumula._id,
+      sequencia: proxSeq,
+      quarto: sumula.quarto_atual,
+      tipo: "falta",
+      equipe,
+      tecnico_id: alvo.tecnico_id || null,
+      jogador_id: alvo.jogador_id || null,
+      categoria_pessoa: "tecnico",
+      tipo_falta: "B",
+      lances_livres: 2,
+      subtipo_briga: subtipo === "normal" ? null : subtipo,
+      marcador_circulo: true,
+      ip: req.ip,
+      user_agent: req.get("user-agent") || null,
+    });
+    const resposta = await montarRespostaSumula(sumula);
+    res.status(201).json({ evento, ...resposta });
+  } catch (error) {
+    console.error("[sumula] registrarFaltaDelegacao:", error);
+    res
+      .status(500)
+      .json({ message: "Erro ao registrar falta delegacao", error: error.message });
+  }
+};
+
+// --- ATUALIZAR EM QUADRA (snapshot pos timeout / fim_quarto) ---
+// FIBA: tecnico nao precisa anunciar pares de substituicao apos timeout ou
+// fim de quarto. Mesario marca quem esta em quadra; o sistema persiste o
+// snapshot como evento set_em_quadra, atualiza sumula.jogadores_X.em_quadra
+// e usa o evento para inferir entradas no PDF (coluna E.).
+export const atualizarEmQuadra = async (req, res) => {
+  const { id } = req.params;
+  const { equipe, jogadores } = req.body || {};
+  try {
+    const sumula = await Sumula.findById(id);
+    if (!sumula) return res.status(404).json({ message: "Sumula nao encontrada" });
+    if (sumula.status !== "em_andamento") {
+      return res.status(400).json({ message: "Sumula nao esta em andamento" });
+    }
+    if (!["A", "B"].includes(equipe)) {
+      return res.status(400).json({ message: "equipe invalida" });
+    }
+    if (!Array.isArray(jogadores) || jogadores.length < 2 || jogadores.length > 5) {
+      return res
+        .status(400)
+        .json({ message: "jogadores deve ter 2 a 5 atleta_ids" });
+    }
+    const ids = jogadores.map((x) => x.toString());
+    if (new Set(ids).size !== ids.length) {
+      return res.status(400).json({ message: "jogadores nao pode ter ids duplicados" });
+    }
+    const lista = equipe === "A" ? sumula.jogadores_a : sumula.jogadores_b;
+    for (const aid of ids) {
+      const jog = lista.find((j) => j.atleta_id.toString() === aid);
+      if (!jog) {
+        return res
+          .status(400)
+          .json({ message: "atleta nao pertence a equipe" });
+      }
+      if (jog.excluido || jog.desqualificado) {
+        return res
+          .status(400)
+          .json({ message: "atleta excluido/desqualificado nao pode estar em quadra" });
+      }
+    }
+
+    const ultimaSeq = await EventoSumula.findOne({ sumula_id: sumula._id })
+      .sort({ sequencia: -1 })
+      .select("sequencia");
+    const proxSeq = (ultimaSeq?.sequencia || 0) + 1;
+
+    const evento = await EventoSumula.create({
+      sumula_id: sumula._id,
+      sequencia: proxSeq,
+      quarto: sumula.quarto_atual,
+      tipo: "set_em_quadra",
+      equipe,
+      jogadores_em_quadra: ids,
+      ip: req.ip,
+      user_agent: req.get("user-agent") || null,
+    });
+
+    const idsSet = new Set(ids);
+    for (const j of lista) {
+      if (j.excluido || j.desqualificado) {
+        j.em_quadra = false;
+        continue;
+      }
+      j.em_quadra = idsSet.has(j.atleta_id.toString());
+    }
+    await sumula.save();
+
+    const resposta = await montarRespostaSumula(sumula);
+    res.status(201).json({ evento, ...resposta });
+  } catch (error) {
+    console.error("[sumula] atualizarEmQuadra:", error);
+    res
+      .status(500)
+      .json({ message: "Erro ao atualizar em quadra", error: error.message });
+  }
+};
+
+// --- 2o CAPITAO: sucessor do jogador-tecnico expulso (FIBA Art. 7.9) ---
+// Quando o jogador-tecnico (que atua como capitao-tecnico) e desqualificado e
+// a equipe nao tem assistente inscrito, um novo capitao e designado. Ele assume
+// como jogador-tecnico (todas as responsabilidades/GD combinado) e aparece na
+// linha do 1o assistente do PDF com o sufixo "(2o CAP)". O original (expulso)
+// permanece na comissao (linha TECNICO) com suas faltas.
+// Body: { equipe: "A"|"B", atleta_id }
+export const definirSucessorTecnico = async (req, res) => {
+  const { id } = req.params;
+  const { equipe, atleta_id } = req.body || {};
+  try {
+    if (!["A", "B"].includes(equipe)) {
+      return res.status(400).json({ message: "equipe invalida" });
+    }
+    if (!atleta_id) {
+      return res.status(400).json({ message: "atleta_id obrigatorio" });
+    }
+    const sumula = await Sumula.findById(id);
+    if (!sumula) return res.status(404).json({ message: "Sumula nao encontrada" });
+    if (sumula.status !== "em_andamento") {
+      return res.status(400).json({ message: "Sumula nao esta em andamento" });
+    }
+    const { principal, assistente } = obterComissaoMembros(sumula, equipe);
+    if (!principal?.atleta_id) {
+      return res
+        .status(400)
+        .json({ message: "Equipe nao usa jogador-tecnico (FIBA Art. 7.9)" });
+    }
+    if (assistente) {
+      return res.status(400).json({
+        message: "Equipe tem assistente inscrito — sucessao nao se aplica",
+      });
+    }
+    const lista = equipe === "A" ? sumula.jogadores_a : sumula.jogadores_b;
+    // O jogador-tecnico em exercicio precisa estar expulso para haver sucessao.
+    const atual = acharJogadorTecnicoAtivo(lista);
+    if (atual && !atual.desqualificado) {
+      return res
+        .status(400)
+        .json({ message: "Jogador-tecnico em exercicio ainda esta em jogo" });
+    }
+    const novoStr = atleta_id.toString();
+    const novo = (lista || []).find(
+      (j) => j.atleta_id && j.atleta_id.toString() === novoStr,
+    );
+    if (!novo) {
+      return res.status(400).json({ message: "Atleta nao pertence a equipe" });
+    }
+    if (novo.excluido || novo.desqualificado) {
+      return res
+        .status(400)
+        .json({ message: "Atleta indisponivel (excluido/expulso)" });
+    }
+    if (novo.numero === null || novo.numero === undefined) {
+      return res
+        .status(400)
+        .json({ message: "2o capitao precisa de numero de camisa" });
+    }
+    if (novo.tecnico_sucessor && novo.jogador_tecnico) {
+      return res
+        .status(400)
+        .json({ message: "Atleta ja e o 2o capitao em exercicio" });
+    }
+    // Troca de capitania + assume como jogador-tecnico sucessor. Mantem
+    // exatamente 1 capitao na equipe (validado no pre-save do modelo).
+    (lista || []).forEach((j) => {
+      j.capitao = j.atleta_id && j.atleta_id.toString() === novoStr;
+    });
+    novo.jogador_tecnico = true;
+    novo.tecnico_sucessor = true;
+    await sumula.save();
+
+    const resposta = await montarRespostaSumula(sumula);
+    res.status(200).json(resposta);
+  } catch (error) {
+    console.error("[sumula] definirSucessorTecnico:", error);
+    res
+      .status(500)
+      .json({ message: "Erro ao definir 2o capitao", error: error.message });
+  }
+};
+
 // --- CANCELAR EVENTO (soft delete) ---
 export const cancelarEvento = async (req, res) => {
   const { id, eventoId } = req.params;
@@ -1128,6 +2182,24 @@ export const cancelarEvento = async (req, res) => {
         .status(400)
         .json({ message: "Nao e possivel cancelar evento de inicio de quarto" });
     }
+    // Desfazer definir_numero so e permitido enquanto o atleta nao registrou
+    // nenhum evento depois — caso contrario sobrariam eventos de um atleta
+    // sem numero (que sumiria da sumula). O botao desfazer global e LIFO e ja
+    // garante isso, mas o log permite cancelar um evento especifico.
+    if (evento.tipo === "definir_numero") {
+      const posteriores = await EventoSumula.countDocuments({
+        sumula_id: sumula._id,
+        jogador_id: evento.jogador_id,
+        sequencia: { $gt: evento.sequencia },
+        cancelado: false,
+      });
+      if (posteriores > 0) {
+        return res.status(400).json({
+          message:
+            "Atleta ja participou apos receber o numero — desfaca os eventos dele primeiro",
+        });
+      }
+    }
     evento.cancelado = true;
     await evento.save();
 
@@ -1139,15 +2211,12 @@ export const cancelarEvento = async (req, res) => {
         evento.jogador_id
       );
       if (jogador) {
-        const contaComoPessoal = ["P", "P2", "U", "U2", "T", "D"].includes(
-          evento.tipo_falta
-        );
-        if (contaComoPessoal && jogador.faltas > 0) {
-          jogador.faltas -= 1;
-          if (jogador.faltas < FALTAS_PESSOAIS_LIMITE) {
-            jogador.excluido = false;
-          }
-        }
+        // faltas recomputado dos eventos ativos (o evento ja foi marcado
+        // cancelado acima) — evita drift de undo/redo.
+        const estadoPosCancel = await computarEstado(sumula._id);
+        jogador.faltas =
+          estadoPosCancel.faltas_jogador[evento.jogador_id.toString()] || 0;
+        jogador.excluido = jogador.faltas >= FALTAS_PESSOAIS_LIMITE;
         // Recalcula desqualificacao a partir dos eventos restantes.
         const faltasRestantes = await EventoSumula.find({
           sumula_id: sumula._id,
@@ -1156,7 +2225,10 @@ export const cancelarEvento = async (req, res) => {
           cancelado: false,
         });
         const temD = faltasRestantes.some(
-          (e) => e.tipo_falta === "D" || e.tipo_falta === "U2"
+          (e) =>
+            e.tipo_falta === "D" ||
+            e.tipo_falta === "U2" ||
+            e.tipo_falta === "F"
         );
         const countU = faltasRestantes.filter(
           (e) => e.tipo_falta === "U" || e.tipo_falta === "U2"
@@ -1165,8 +2237,27 @@ export const cancelarEvento = async (req, res) => {
           (e) => e.tipo_falta === "T"
         ).length;
         const temUeT = countU >= 1 && countT >= 1;
-        jogador.desqualificado =
-          temD || countU >= 2 || countT >= 2 || temUeT;
+        let desq = temD || countU >= 2 || countT >= 2 || temUeT;
+        // FIBA Art. 7.9 / B.8.3.7 — jogador-tecnico: matriz de GD combinada
+        // (T/U como jogador + C/B como tecnico).
+        if (jogador.jogador_tecnico) {
+          const countC = faltasRestantes.filter(
+            (e) => e.tipo_falta === "C" && !e.marcador_circulo
+          ).length;
+          const countB = faltasRestantes.filter(
+            (e) => e.tipo_falta === "B" && !e.marcador_circulo
+          ).length;
+          const tu = countU + countT;
+          desq =
+            desq ||
+            tu >= 2 ||
+            countC >= 2 ||
+            countB >= 3 ||
+            (countC >= 1 && tu >= 1) ||
+            (countB >= 2 && tu >= 1) ||
+            (countC >= 1 && countB >= 2);
+        }
+        jogador.desqualificado = desq;
         await sumula.save();
       }
     }
@@ -1204,6 +2295,89 @@ export const cancelarEvento = async (req, res) => {
       }
     }
 
+    // Se cancelou um TO real precedido pelo TO sintetico "perdido_2min",
+    // cancela tambem o sintetico — caso contrario sobra um slot riscado
+    // sem o TO real que o motivou.
+    if (
+      evento.tipo === "timeout" &&
+      !evento.perdido_2min &&
+      evento.equipe
+    ) {
+      const anterior = await EventoSumula.findOne({
+        sumula_id: sumula._id,
+        sequencia: { $lt: evento.sequencia },
+        tipo: "timeout",
+        equipe: evento.equipe,
+        perdido_2min: true,
+        cancelado: false,
+      }).sort({ sequencia: -1 });
+      if (anterior) {
+        anterior.cancelado = true;
+        await anterior.save();
+      }
+    }
+
+    // Cancelar set_em_quadra: reverte em_quadra para o snapshot anterior
+    // (set_em_quadra ativo previo) ou para os titulares iniciais (se nao
+    // existir). Permite ao mesario desfazer e refazer a selecao.
+    if (evento.tipo === "set_em_quadra" && evento.equipe) {
+      const lista =
+        evento.equipe === "A" ? sumula.jogadores_a : sumula.jogadores_b;
+      const anterior = await EventoSumula.findOne({
+        sumula_id: sumula._id,
+        sequencia: { $lt: evento.sequencia },
+        tipo: "set_em_quadra",
+        equipe: evento.equipe,
+        cancelado: false,
+      }).sort({ sequencia: -1 });
+      if (anterior) {
+        const ids = new Set(
+          (anterior.jogadores_em_quadra || []).map((x) => x.toString()),
+        );
+        for (const j of lista) {
+          if (j.excluido || j.desqualificado) {
+            j.em_quadra = false;
+            continue;
+          }
+          j.em_quadra = ids.has(j.atleta_id.toString());
+        }
+      } else {
+        for (const j of lista) {
+          if (j.excluido || j.desqualificado) {
+            j.em_quadra = false;
+            continue;
+          }
+          j.em_quadra = !!j.titular;
+        }
+      }
+      await sumula.save();
+    }
+
+    // Cancelar definir_numero: atleta volta a ficar sem numero. So e possivel
+    // desfazer enquanto ele nao registrou nenhum evento (garantido pela ordem
+    // LIFO do botao desfazer — sem numero ele nao pode pontuar).
+    if (
+      evento.tipo === "definir_numero" &&
+      evento.equipe &&
+      evento.jogador_id
+    ) {
+      const jogador = findJogadorEmSumula(
+        sumula,
+        evento.equipe,
+        evento.jogador_id
+      );
+      if (jogador) {
+        jogador.numero = null;
+        await sumula.save();
+      }
+    }
+
+    // Se o undo reintegrou o jogador-tecnico original, desfaz a sucessao do
+    // 2o capitao (capitania volta ao original; flags do sucessor limpas).
+    const revA = reverterSucessaoSeReintegrado(sumula, "A");
+    const revB = reverterSucessaoSeReintegrado(sumula, "B");
+    if (revA || revB) await sumula.save();
+
     const resposta = await montarRespostaSumula(sumula);
     res.json({ evento, ...resposta });
   } catch (error) {
@@ -1211,6 +2385,72 @@ export const cancelarEvento = async (req, res) => {
     res
       .status(500)
       .json({ message: "Erro ao cancelar evento", error: error.message });
+  }
+};
+
+// --- DURANTE O JOGO: definir numero de atleta escalado sem numero ---
+// Atleta que chegou atrasado entra na escalacao sem numero e nao pode pontuar.
+// O mesario define o numero quando ele chega; o atleta fica disponivel como
+// substituto no banco. Registrado como evento para entrar no botao desfazer.
+export const definirNumeroJogador = async (req, res) => {
+  const { id, atletaId } = req.params;
+  const { numero } = req.body;
+  try {
+    const sumula = await Sumula.findById(id);
+    if (!sumula) return res.status(404).json({ message: "Sumula nao encontrada" });
+    if (sumula.status !== "em_andamento") {
+      return res.status(400).json({ message: "Sumula nao esta em andamento" });
+    }
+    if (!Number.isInteger(numero) || numero < 0 || numero > 99) {
+      return res.status(400).json({ message: "Numero fora do intervalo 0-99" });
+    }
+
+    let jogador = findJogadorEmSumula(sumula, "A", atletaId);
+    let equipe = "A";
+    if (!jogador) {
+      jogador = findJogadorEmSumula(sumula, "B", atletaId);
+      equipe = "B";
+    }
+    if (!jogador) {
+      return res.status(404).json({ message: "Atleta nao esta na escalacao" });
+    }
+    if (jogador.numero !== null && jogador.numero !== undefined) {
+      return res
+        .status(400)
+        .json({ message: "Atleta ja possui numero de camisa" });
+    }
+
+    const lista = equipe === "A" ? sumula.jogadores_a : sumula.jogadores_b;
+    if (lista.some((j) => j.numero === numero)) {
+      return res
+        .status(400)
+        .json({ message: `Numero ${numero} ja usado na equipe ${equipe}` });
+    }
+
+    jogador.numero = numero;
+
+    const ultimaSeq = await EventoSumula.findOne({ sumula_id: sumula._id })
+      .sort({ sequencia: -1 })
+      .select("sequencia");
+    const proxSeq = (ultimaSeq?.sequencia || 0) + 1;
+
+    await EventoSumula.create({
+      sumula_id: sumula._id,
+      sequencia: proxSeq,
+      quarto: sumula.quarto_atual,
+      tipo: "definir_numero",
+      equipe,
+      jogador_id: atletaId,
+      ip: req.ip,
+      user_agent: req.get("user-agent") || null,
+    });
+
+    await sumula.save();
+    const resposta = await montarRespostaSumula(sumula);
+    res.json(resposta);
+  } catch (error) {
+    console.error("[sumula] definirNumeroJogador:", error);
+    res.status(400).json({ message: error.message });
   }
 };
 
@@ -1235,9 +2475,12 @@ const recomputarSumula = async (sumula) => {
     cancelado: false,
   }).sort({ sequencia: 1 });
 
-  // Contadores por jogador p/ detectar 2 U, 2 T, U+T (GD).
+  // Contadores por jogador p/ detectar 2 U, 2 T, U+T (GD). cs/bs sao usados
+  // so para o jogador-tecnico (matriz combinada B.8.3.7).
   const usPorJog = new Map();
   const tsPorJog = new Map();
+  const csPorJog = new Map();
+  const bsPorJog = new Map();
   const inc = (map, key) => map.set(key, (map.get(key) || 0) + 1);
 
   let totalPontos = 0;
@@ -1281,14 +2524,24 @@ const recomputarSumula = async (sumula) => {
     if (ev.tipo === "falta") {
       const jogador = findJogadorEmSumula(sumula, ev.equipe, ev.jogador_id);
       if (!jogador) continue;
-      const pessoal = ["P", "P2", "U", "U2", "T", "D"].includes(ev.tipo_falta);
+      // FIBA OBRI 36-33 — para o jogador-tecnico, C/B (categoria "tecnico")
+      // tambem contam para o limite de 5.
+      const pessoal =
+        ["P", "P2", "U", "U2", "T", "D", "F"].includes(ev.tipo_falta) ||
+        (jogador.jogador_tecnico &&
+          (ev.tipo_falta === "C" || ev.tipo_falta === "B") &&
+          !ev.marcador_circulo);
       if (pessoal) {
         jogador.faltas += 1;
         if (jogador.faltas >= FALTAS_PESSOAIS_LIMITE) {
           jogador.excluido = true;
         }
       }
-      if (ev.tipo_falta === "D" || ev.tipo_falta === "U2") {
+      if (
+        ev.tipo_falta === "D" ||
+        ev.tipo_falta === "U2" ||
+        ev.tipo_falta === "F"
+      ) {
         jogador.desqualificado = true;
       }
       const key = ev.jogador_id?.toString();
@@ -1299,6 +2552,25 @@ const recomputarSumula = async (sumula) => {
         const ts = tsPorJog.get(key) || 0;
         if (us >= 2 || ts >= 2 || (us >= 1 && ts >= 1)) {
           jogador.desqualificado = true;
+        }
+        // FIBA Art. 7.9 / B.8.3.7 — jogador-tecnico: matriz de GD combinada
+        // (T/U como jogador + C/B como tecnico).
+        if (jogador.jogador_tecnico) {
+          if (ev.tipo_falta === "C" && !ev.marcador_circulo) inc(csPorJog, key);
+          if (ev.tipo_falta === "B" && !ev.marcador_circulo) inc(bsPorJog, key);
+          const tu = us + ts;
+          const c = csPorJog.get(key) || 0;
+          const b = bsPorJog.get(key) || 0;
+          if (
+            tu >= 2 ||
+            c >= 2 ||
+            b >= 3 ||
+            (c >= 1 && tu >= 1) ||
+            (b >= 2 && tu >= 1) ||
+            (c >= 1 && b >= 2)
+          ) {
+            jogador.desqualificado = true;
+          }
         }
       }
       continue;
@@ -1314,6 +2586,21 @@ const recomputarSumula = async (sumula) => {
           ev.jogador_entra_id
         );
         if (jogEntra) jogEntra.em_quadra = true;
+      }
+    }
+
+    if (ev.tipo === "set_em_quadra") {
+      const lista =
+        ev.equipe === "A" ? sumula.jogadores_a : sumula.jogadores_b;
+      const novosIds = new Set(
+        (ev.jogadores_em_quadra || []).map((x) => x.toString()),
+      );
+      for (const j of lista) {
+        if (j.excluido || j.desqualificado) {
+          j.em_quadra = false;
+          continue;
+        }
+        j.em_quadra = novosIds.has(j.atleta_id.toString());
       }
     }
   }
@@ -1670,9 +2957,16 @@ export const finalizarSumula = async (req, res) => {
         placar_a: sumula.placar_final.pontos_a,
         placar_b: sumula.placar_final.pontos_b,
         status: "finalizado",
+        finalizado_por: "sumula",
       },
       { new: true }
     );
+
+    // Avisa os viewers ao vivo que o jogo encerrou (trocam para a visão final).
+    aoVivoBus.publicar(String(sumula.jogo_id), {
+      encerrado: true,
+      placar: { A: sumula.placar_final.pontos_a, B: sumula.placar_final.pontos_b },
+    });
 
     if (jogo) {
       const escalacoes = await Escalacao.find({ jogo_id: jogo._id });

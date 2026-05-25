@@ -40,6 +40,14 @@ const JogoSchema = new mongoose.Schema(
       enum: ["agendado", "em andamento", "finalizado", "cancelado"],
       default: "agendado",
     },
+    // Como o jogo foi finalizado: via súmula eletrônica completa ou via scout
+    // manual. Define quais ações o admin vê no jogo finalizado (baixar súmula vs
+    // apagar scout). null = ainda não finalizado.
+    finalizado_por: {
+      type: String,
+      enum: ["sumula", "scout", null],
+      default: null,
+    },
     arbitros_escalados: { type: ArbitrosEscaladosSchema, default: () => ({}) },
   },
   { timestamps: true }

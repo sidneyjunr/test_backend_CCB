@@ -3,12 +3,18 @@ import { protect, admin } from "../middleware/authMiddleware.js";
 import {
   adicionarCategoria,
   analisarInscricao,
+  atribuirGrupoEquipe,
   atualizarPlacar,
   criarCompeticao,
   criarEquipe,
   criarJogo,
   criarUsuarioTecnico,
+  editarCategoria,
   escalarArbitros,
+  finalizarScout,
+  resetarScout,
+  excluirCategoria,
+  excluirCompeticao,
   getAtletasEquipe,
   getCompeticoes,
   getEquipes,
@@ -252,6 +258,25 @@ router.post("/competicao", protect, admin, criarCompeticao);
 
 router.patch("/competicao/:id", protect, admin, updateCompeticao);
 
+// Exclui competição (bloqueia se houver jogos/equipes vinculados)
+router.delete("/competicao/:id", protect, admin, excluirCompeticao);
+
+// Edita uma categoria específica (nome, formato, grupos, critérios, pontuação)
+router.patch(
+  "/competicao/:id/categoria/:categoriaId",
+  protect,
+  admin,
+  editarCategoria,
+);
+
+// Exclui uma categoria (bloqueia se houver jogos/equipes vinculados)
+router.delete(
+  "/competicao/:id/categoria/:categoriaId",
+  protect,
+  admin,
+  excluirCategoria,
+);
+
 /**
  * @swagger
  * /api/admin/tecnicos:
@@ -267,6 +292,9 @@ router.patch("/competicao/:id", protect, admin, updateCompeticao);
 router.get("/tecnicos", protect, admin, getTecnicos);
 
 router.get("/equipe", protect, admin, getEquipes);
+
+// Atribui/remove o grupo de uma equipe (formato grupos)
+router.patch("/equipe/:id/grupo", protect, admin, atribuirGrupoEquipe);
 
 /**
  * @swagger
@@ -497,6 +525,10 @@ router.post("/jogo", protect, admin, criarJogo);
 router.patch("/jogo/:id", protect, admin, atualizarPlacar);
 
 router.patch("/jogo/:id/arbitros", protect, admin, escalarArbitros);
+
+// Scout manual (fluxo alternativo à súmula eletrônica completa).
+router.post("/jogo/:id/finalizar-scout", protect, admin, finalizarScout);
+router.post("/jogo/:id/resetar-scout", protect, admin, resetarScout);
 
 /**
  * @swagger

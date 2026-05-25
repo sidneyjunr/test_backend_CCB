@@ -12,7 +12,12 @@ import {
   patchTitulares,
   patchComissao,
   iniciarSumula,
+  definirNumeroJogador,
   registrarEvento,
+  registrarBriga,
+  registrarFaltaDelegacao,
+  atualizarEmQuadra,
+  definirSucessorTecnico,
   cancelarEvento,
   hardDeletarEvento,
   editarEvento,
@@ -92,7 +97,30 @@ router.patch("/:id/comissao", protect, admin, patchComissao);
 router.post("/:id/iniciar", protect, admin, iniciarSumula);
 
 // --- Durante o jogo ---
+router.patch(
+  "/:id/jogador/:atletaId/numero",
+  protect,
+  admin,
+  eventoLimiter,
+  definirNumeroJogador,
+);
 router.post("/:id/evento", protect, admin, eventoLimiter, registrarEvento);
+router.post("/:id/briga", protect, admin, eventoLimiter, registrarBriga);
+router.post(
+  "/:id/falta-delegacao",
+  protect,
+  admin,
+  eventoLimiter,
+  registrarFaltaDelegacao,
+);
+router.post("/:id/em-quadra", protect, admin, eventoLimiter, atualizarEmQuadra);
+router.patch(
+  "/:id/sucessor-tecnico",
+  protect,
+  admin,
+  eventoLimiter,
+  definirSucessorTecnico,
+);
 router.patch(
   "/:id/evento/:eventoId/cancelar",
   protect,

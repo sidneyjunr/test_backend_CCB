@@ -5,8 +5,14 @@ import { Competicao } from "../models/Competicao.js";
 import { Inscricao } from "../models/Inscricao.js";
 import { Sumula } from "../models/Sumula.js";
 import { EventoSumula } from "../models/EventoSumula.js";
+import { Atleta } from "../models/Atleta.js";
 import Ponto from "../models/Ponto.js";
 import mongoose from "mongoose";
+import {
+  computarEstado,
+  montarDinamicoAoVivo,
+} from "../services/sumulaEstadoService.js";
+import * as aoVivoBus from "../services/aoVivoBus.js";
 
 export const getResultadosHome = async (req, res) => {
   try {
@@ -254,17 +260,32 @@ export const getClassificacao = async (req, res) => {
       return res.status(404).json({ message: "Categoria não encontrada" });
     }
 
-    const categoriaId = competicao.categorias.find(
+    const categoriaDoc = competicao.categorias.find(
       (cat) => cat.nome === categoria,
-    )._id;
+    );
+    const categoriaId = categoriaDoc._id;
 
-    // Agregação para calcular a classificação com critérios de desempate
-    const classificacao = await Jogo.aggregate([
-      // 1. Filtrar jogos finalizados da categoria
+    // Configuração da categoria (defaults defensivos para documentos antigos)
+    const pontosVitoria = categoriaDoc.pontos_vitoria ?? 2;
+    const pontosDerrota = categoriaDoc.pontos_derrota ?? 1;
+    const criterios =
+      categoriaDoc.criterios_classificacao &&
+      categoriaDoc.criterios_classificacao.length > 0
+        ? categoriaDoc.criterios_classificacao
+        : ["pontos", "confronto_direto", "saldo", "pontos_pro"];
+    const formato = categoriaDoc.formato || "chaveamento_unico";
+    const cfg = { pontosVitoria, pontosDerrota };
+
+    // Agregação: estatísticas por equipe a partir dos jogos finalizados
+    const times = await Jogo.aggregate([
+      // 1. Filtrar jogos finalizados da categoria.
+      //    Basquete não admite empate (prorrogação decide); jogo finalizado
+      //    com placar igual é dado inválido e é descartado da classificação.
       {
         $match: {
           categoria_id: new mongoose.Types.ObjectId(categoriaId),
           status: "finalizado",
+          $expr: { $ne: ["$placar_a", "$placar_b"] },
         },
       },
 
@@ -282,13 +303,7 @@ export const getClassificacao = async (req, res) => {
                   $cond: [
                     { $gt: ["$placar_a", "$placar_b"] },
                     "vitoria",
-                    {
-                      $cond: [
-                        { $lt: ["$placar_a", "$placar_b"] },
-                        "derrota",
-                        "empate",
-                      ],
-                    },
+                    "derrota",
                   ],
                 },
               },
@@ -305,13 +320,7 @@ export const getClassificacao = async (req, res) => {
                   $cond: [
                     { $gt: ["$placar_b", "$placar_a"] },
                     "vitoria",
-                    {
-                      $cond: [
-                        { $lt: ["$placar_b", "$placar_a"] },
-                        "derrota",
-                        "empate",
-                      ],
-                    },
+                    "derrota",
                   ],
                 },
               },
@@ -353,15 +362,20 @@ export const getClassificacao = async (req, res) => {
         },
       },
 
-      // 5. Calcular saldo e pontos
+      // 5. Calcular saldo e pontos (pontuação configurável por categoria)
       {
         $addFields: {
           saldo: { $subtract: ["$pontos_pro", "$pontos_contra"] },
-          pontos: { $add: [{ $multiply: ["$vitorias", 2] }, "$derrotas"] },
+          pontos: {
+            $add: [
+              { $multiply: ["$vitorias", pontosVitoria] },
+              { $multiply: ["$derrotas", pontosDerrota] },
+            ],
+          },
         },
       },
 
-      // 6. Fazer lookup para pegar o nome da equipe e manter ordem
+      // 6. Lookup para nome e grupo da equipe
       {
         $lookup: {
           from: "equipes",
@@ -372,11 +386,12 @@ export const getClassificacao = async (req, res) => {
       },
       { $unwind: "$equipe_info" },
 
-      // 7. Projetar os campos finais mantendo confrontos para posterior processamento
+      // 7. Projetar campos finais (confrontos é auxiliar p/ confronto direto)
       {
         $project: {
           _id: 1,
           nome_equipe: "$equipe_info.nome_equipe",
+          grupo_id: "$equipe_info.grupo_id",
           jogos: 1,
           vitorias: 1,
           derrotas: 1,
@@ -387,16 +402,62 @@ export const getClassificacao = async (req, res) => {
           confrontos: 1,
         },
       },
-
-      // 8. Ordenação inicial por pontos
-      { $sort: { pontos: -1, saldo: -1, pontos_pro: -1 } },
     ]);
 
-    // Processamento pós-agregação para critério de confronto direto
-    const classificacaoOrdenada =
-      processarClassificacaoComConfrontoDireto(classificacao);
+    // Incluir equipes da categoria que ainda não jogaram (sem doc em Jogo),
+    // com estatísticas zeradas, para que apareçam na tabela.
+    const equipesCategoria = await Equipe.find({ categoria_id: categoriaId })
+      .select("nome_equipe grupo_id")
+      .lean();
+    const idsComJogo = new Set(times.map((t) => t._id.toString()));
+    equipesCategoria.forEach((eq) => {
+      if (!idsComJogo.has(eq._id.toString())) {
+        times.push({
+          _id: eq._id,
+          nome_equipe: eq.nome_equipe,
+          grupo_id: eq.grupo_id || null,
+          jogos: 0,
+          vitorias: 0,
+          derrotas: 0,
+          pontos_pro: 0,
+          pontos_contra: 0,
+          saldo: 0,
+          pontos: 0,
+          confrontos: [],
+        });
+      }
+    });
 
-    res.status(200).json(classificacaoOrdenada);
+    if (formato === "grupos") {
+      // Uma tabela de classificação por grupo configurado na categoria
+      const grupos = (categoriaDoc.grupos || []).map((g) => {
+        const timesDoGrupo = times.filter(
+          (t) => t.grupo_id && t.grupo_id.toString() === g._id.toString(),
+        );
+        return {
+          _id: g._id,
+          nome: g.nome,
+          classificacao: limparConfrontos(
+            classificarTimes(timesDoGrupo, criterios, cfg),
+          ),
+        };
+      });
+      // Equipes da categoria ainda não atribuídas a um grupo
+      const semGrupo = limparConfrontos(
+        classificarTimes(
+          times.filter((t) => !t.grupo_id),
+          criterios,
+          cfg,
+        ),
+      );
+      return res.status(200).json({ formato: "grupos", grupos, semGrupo });
+    }
+
+    // Chaveamento único: tabela plana (compatível com o front atual)
+    const classificacao = limparConfrontos(
+      classificarTimes(times, criterios, cfg),
+    );
+    res.status(200).json(classificacao);
   } catch (error) {
     console.error("Erro na agregação:", error);
     res.status(500).json({
@@ -406,89 +467,85 @@ export const getClassificacao = async (req, res) => {
   }
 };
 
-// Função para processar confronto direto
-function processarClassificacaoComConfrontoDireto(times) {
-  // Agrupar times por pontuação
-  const grupos = {};
-
-  times.forEach((time) => {
-    if (!grupos[time.pontos]) {
-      grupos[time.pontos] = [];
-    }
-    grupos[time.pontos].push(time);
-  });
-
-  const resultado = [];
-
-  // Para cada grupo de pontos iguais
-  Object.keys(grupos)
-    .sort((a, b) => b - a)
-    .forEach((pontos) => {
-      const grupo = grupos[pontos];
-
-      if (grupo.length === 1) {
-        // Apenas um time com essa pontuação
-        resultado.push(grupo[0]);
-      } else {
-        // Múltiplos times com mesma pontuação - aplicar confronto direto
-        const timesOrdenados = ordenarPorConfrontoDireto(grupo);
-        resultado.push(...timesOrdenados);
-      }
-    });
-
-  // Remover campo confrontos do resultado final
-  return resultado.map((time) => {
-    const { confrontos, ...rest } = time;
-    return rest;
-  });
+// Remove o campo auxiliar `confrontos` do resultado final.
+function limparConfrontos(times) {
+  return times.map(({ confrontos, ...rest }) => rest);
 }
 
-// Função para ordenar times com mesma pontuação pelo confronto direto
-function ordenarPorConfrontoDireto(timesComMesmaPontos) {
-  // Calcular pontos do confronto direto entre esses times
-  const timesComConfrontoDireto = timesComMesmaPontos.map((time) => {
-    let pontosConfrontoDireto = 0;
-    let saldoConfrontoDireto = 0;
+// Valor de um critério simples (maior = melhor) para um time.
+function valorCriterio(time, criterio) {
+  switch (criterio) {
+    case "pontos":
+      return time.pontos;
+    case "saldo":
+      return time.saldo;
+    case "pontos_pro":
+      return time.pontos_pro;
+    case "pontos_contra":
+      return -time.pontos_contra; // menos pontos sofridos = melhor
+    case "vitorias":
+      return time.vitorias;
+    case "aproveitamento":
+      return time.jogos > 0 ? time.vitorias / time.jogos : 0;
+    default:
+      return 0;
+  }
+}
 
-    // Verificar confrontos com outros times do grupo
-    time.confrontos.forEach((confronto) => {
-      // Verificar se o adversário está no grupo
-      const adversarioNoGrupo = timesComMesmaPontos.some(
-        (t) => t._id.toString() === confronto.equipe_adversaria_id.toString(),
-      );
+// Confronto direto: pontos e saldo de um time considerando só adversários do subgrupo.
+function valorConfrontoDireto(time, subgrupo, cfg) {
+  const idsSubgrupo = new Set(subgrupo.map((t) => t._id.toString()));
+  let pontos = 0;
+  let saldo = 0;
+  (time.confrontos || []).forEach((c) => {
+    if (idsSubgrupo.has(c.equipe_adversaria_id.toString())) {
+      if (c.resultado === "vitoria") pontos += cfg.pontosVitoria;
+      else if (c.resultado === "derrota") pontos += cfg.pontosDerrota;
+      saldo += c.placar_pro - c.placar_contra;
+    }
+  });
+  return { pontos, saldo };
+}
 
-      if (adversarioNoGrupo) {
-        if (confronto.resultado === "vitoria") {
-          pontosConfrontoDireto += 2;
-        } else if (confronto.resultado === "derrota") {
-          pontosConfrontoDireto += 1;
-        }
-        saldoConfrontoDireto += confronto.placar_pro - confronto.placar_contra;
-      }
-    });
+// Ordena os times aplicando os critérios na ordem de prioridade.
+// Empate em um critério é desempatado pelo próximo critério (recursivo).
+function classificarTimes(times, criterios, cfg) {
+  if (times.length <= 1 || criterios.length === 0) return [...times];
 
-    return {
-      ...time,
-      pontosConfrontoDireto,
-      saldoConfrontoDireto,
-    };
+  const [criterio, ...resto] = criterios;
+
+  // Valor primário e secundário de cada time para este critério
+  const comValor = times.map((time) => {
+    if (criterio === "confronto_direto") {
+      const cd = valorConfrontoDireto(time, times, cfg);
+      return { time, valor: cd.pontos, valor2: cd.saldo };
+    }
+    return { time, valor: valorCriterio(time, criterio), valor2: 0 };
   });
 
-  // Ordenar por: confronto direto (pontos), saldo do confronto direto, saldo geral, pp
-  timesComConfrontoDireto.sort((a, b) => {
-    if (a.pontosConfrontoDireto !== b.pontosConfrontoDireto) {
-      return b.pontosConfrontoDireto - a.pontosConfrontoDireto;
-    }
-    if (a.saldoConfrontoDireto !== b.saldoConfrontoDireto) {
-      return b.saldoConfrontoDireto - a.saldoConfrontoDireto;
-    }
-    if (a.saldo !== b.saldo) {
-      return b.saldo - a.saldo;
-    }
-    return b.pontos_pro - a.pontos_pro;
-  });
+  comValor.sort((a, b) => b.valor - a.valor || b.valor2 - a.valor2);
 
-  return timesComConfrontoDireto;
+  // Agrupa times empatados neste critério e desempata pelos critérios restantes
+  const resultado = [];
+  let i = 0;
+  while (i < comValor.length) {
+    let j = i;
+    while (
+      j < comValor.length &&
+      comValor[j].valor === comValor[i].valor &&
+      comValor[j].valor2 === comValor[i].valor2
+    ) {
+      j++;
+    }
+    const empatados = comValor.slice(i, j).map((x) => x.time);
+    if (empatados.length === 1) {
+      resultado.push(empatados[0]);
+    } else {
+      resultado.push(...classificarTimes(empatados, resto, cfg));
+    }
+    i = j;
+  }
+  return resultado;
 }
 
 // --- ESTATÍSTICAS DE ATLETAS ---
@@ -718,6 +775,148 @@ export const getPontosAtleta = async (req, res) => {
 };
 
 /**
+ * Fallback de scout para jogos antigos (sistema legado de scout manual): em vez
+ * de EventoSumula, os pontos ficam na collection `Ponto` (atleta/equipe/quarto/
+ * tipo_cesta). Reconstrói o mesmo formato (quartos + scout_a/b) a partir dela.
+ * Retorna null se não houver nenhum Ponto para o jogo.
+ */
+const montarScoutDePonto = async (jogo) => {
+  const pontos = await Ponto.find({ jogo_id: jogo._id }).lean();
+  if (!pontos.length) return null;
+
+  const idEquipeA = String(jogo.equipe_a._id);
+  const maxQuarto = Math.max(4, ...pontos.map((p) => p.quarto || 0));
+
+  // Escalações do jogo: usadas para listar TODOS os atletas escalados (mesmo
+  // quem não pontuou) e o número de camisa salvo na finalização do scout.
+  const escalacoes = await Escalacao.find({ jogo_id: jogo._id }).lean();
+  const rosterPorEquipe = new Map(); // equipe_id -> [{ atleta_id, numero_camisa }]
+  for (const esc of escalacoes) {
+    const camisaPorAtleta = new Map(
+      (esc.camisas || []).map((c) => [String(c.atleta_id), c.numero_camisa]),
+    );
+    const roster = (esc.atletas_selecionados || []).map((aid) => ({
+      atleta_id: aid,
+      numero_camisa: camisaPorAtleta.get(String(aid)) ?? null,
+    }));
+    rosterPorEquipe.set(String(esc.equipe_id), roster);
+  }
+
+  // Nomes de todos os atletas (escalados + qualquer um que tenha pontuado).
+  const atletaIds = [
+    ...new Set([
+      ...pontos.map((p) => String(p.atleta_id)),
+      ...escalacoes.flatMap((esc) =>
+        (esc.atletas_selecionados || []).map((aid) => String(aid)),
+      ),
+    ]),
+  ];
+  const atletas = await Atleta.find({ _id: { $in: atletaIds } })
+    .select("nome_completo")
+    .lean();
+  const nomePorId = new Map(
+    atletas.map((a) => [String(a._id), a.nome_completo || "—"]),
+  );
+
+  const novoQuartos = () =>
+    Array.from({ length: maxQuarto }, () => ({
+      pontos: 0,
+      bolas_de_3: 0,
+      bolas_de_2: 0,
+      lances_livres: 0,
+    }));
+
+  const mapA = new Map();
+  const mapB = new Map();
+  const ensure = (map, p) => {
+    const key = String(p.atleta_id);
+    if (!map.has(key)) {
+      map.set(key, {
+        atleta_id: p.atleta_id,
+        nome_completo: nomePorId.get(key) || "—",
+        numero_camisa: p.numero_camisa != null ? String(p.numero_camisa) : "—",
+        pontos_totais: 0,
+        bolas_de_3: 0,
+        bolas_de_2: 0,
+        lances_livres: 0,
+        quartos: novoQuartos(),
+      });
+    }
+    return map.get(key);
+  };
+
+  // Pré-popula os mapas com o elenco inteiro (zerado), para que atletas que não
+  // pontuaram também apareçam no scout.
+  const seedRoster = (equipeId, map) => {
+    for (const r of rosterPorEquipe.get(String(equipeId)) || []) {
+      const key = String(r.atleta_id);
+      if (map.has(key)) continue;
+      map.set(key, {
+        atleta_id: r.atleta_id,
+        nome_completo: nomePorId.get(key) || "—",
+        numero_camisa: r.numero_camisa != null ? String(r.numero_camisa) : "—",
+        pontos_totais: 0,
+        bolas_de_3: 0,
+        bolas_de_2: 0,
+        lances_livres: 0,
+        quartos: novoQuartos(),
+      });
+    }
+  };
+  seedRoster(jogo.equipe_a._id, mapA);
+  seedRoster(jogo.equipe_b._id, mapB);
+
+  for (const p of pontos) {
+    const valor = p.tipo_cesta; // 1=LL, 2=2pts, 3=3pts
+    if (![1, 2, 3].includes(valor)) continue;
+    const ehA = String(p.equipe_id) === idEquipeA;
+    const at = ensure(ehA ? mapA : mapB, p);
+    at.pontos_totais += valor;
+    if (valor === 3) at.bolas_de_3++;
+    else if (valor === 2) at.bolas_de_2++;
+    else if (valor === 1) at.lances_livres++;
+    const qi = (p.quarto || 1) - 1;
+    if (qi >= 0 && qi < maxQuarto) {
+      const q = at.quartos[qi];
+      q.pontos += valor;
+      if (valor === 3) q.bolas_de_3++;
+      else if (valor === 2) q.bolas_de_2++;
+      else if (valor === 1) q.lances_livres++;
+    }
+  }
+
+  const formatScout = (map) =>
+    Array.from(map.values())
+      .map((s) => ({
+        atleta_id: s.atleta_id,
+        nome_completo: s.nome_completo,
+        numero_camisa: s.numero_camisa,
+        pontos_totais: s.pontos_totais,
+        bolas_de_3: s.bolas_de_3,
+        bolas_de_2: s.bolas_de_2,
+        lances_livres: s.lances_livres,
+        pontos_por_quarto: s.quartos,
+      }))
+      .sort((a, b) => b.pontos_totais - a.pontos_totais);
+
+  const calcQuartos = (ehA) => {
+    const q = Array.from({ length: maxQuarto }, () => 0);
+    for (const p of pontos) {
+      if ((String(p.equipe_id) === idEquipeA) !== ehA) continue;
+      const qi = (p.quarto || 1) - 1;
+      if (qi >= 0 && qi < maxQuarto) q[qi] += p.tipo_cesta;
+    }
+    return q;
+  };
+
+  return {
+    quartos: { team_a: calcQuartos(true), team_b: calcQuartos(false) },
+    scout_a: formatScout(mapA),
+    scout_b: formatScout(mapB),
+  };
+};
+
+/**
  * @desc    Retorna dados completos de scout de um jogo: placar, quartos, atletas de ambos os times.
  */
 export const getScoutJogo = async (req, res) => {
@@ -822,11 +1021,15 @@ export const getScoutJogo = async (req, res) => {
     };
 
     if (!sumula) {
+      // Sem súmula eletrônica: tenta o scout legado (collection Ponto).
+      const legado = await montarScoutDePonto(jogo);
       return res.json({
         ...respostaBase,
-        quartos: { team_a: [0, 0, 0, 0], team_b: [0, 0, 0, 0] },
-        scout_a: [],
-        scout_b: [],
+        ...(legado || {
+          quartos: { team_a: [0, 0, 0, 0], team_b: [0, 0, 0, 0] },
+          scout_a: [],
+          scout_b: [],
+        }),
       });
     }
 
@@ -835,6 +1038,15 @@ export const getScoutJogo = async (req, res) => {
       tipo: "ponto",
       cancelado: false,
     }).lean();
+
+    // Súmula existe mas sem pontos registrados (ex.: jogo antigo migrado só com
+    // escalação) → ainda tenta o scout legado da collection Ponto.
+    if (eventosPonto.length === 0) {
+      const legado = await montarScoutDePonto(jogo);
+      if (legado) {
+        return res.json({ ...respostaBase, ...legado });
+      }
+    }
 
     const maxQuarto = Math.max(
       4,
@@ -986,4 +1198,173 @@ export const getCompeticoesPublic = async (req, res) => {
   } catch (error) {
     res.status(500).json({ message: "Erro ao buscar competições", error: error.message });
   }
+};
+
+// Monta nomes da equipe de arbitragem + mesa a partir da súmula.
+const montarArbitros = (sumula) => ({
+  crew_chief: sumula.arbitragem?.crew_chief || null,
+  fiscal_1: sumula.arbitragem?.fiscal_1 || null,
+  fiscal_2: sumula.arbitragem?.fiscal_2 || null,
+  apontador: sumula.mesa?.apontador || null,
+  cronometrista: sumula.mesa?.cronometrista || null,
+  operador_24s: sumula.mesa?.operador_24s || null,
+  representante: sumula.mesa?.representante || null,
+});
+
+const montarTecnicos = (sumula) => {
+  const map = (lista) =>
+    (lista || []).map((m) => ({ nome: m.nome, funcao: m.funcao }));
+  return { A: map(sumula.comissao_a), B: map(sumula.comissao_b) };
+};
+
+// Elenco completo de cada equipe (todos os atletas escalados, pontuando ou
+// não) — o front usa para listar todos no scout, não só quem fez pontos.
+const montarElenco = (sumula) => {
+  const map = (lista) =>
+    (lista || [])
+      .filter((j) => j.atleta_id)
+      .map((j) => ({
+        atleta_id: String(j.atleta_id._id || j.atleta_id),
+        nome: j.atleta_id.nome_completo || "—",
+        numero: j.numero ?? null,
+      }));
+  return { A: map(sumula.jogadores_a), B: map(sumula.jogadores_b) };
+};
+
+/**
+ * @desc    Snapshot inicial da visão ao vivo de um jogo: info estática
+ *          (data/hora, local, competição, árbitros, técnicos) + estado
+ *          dinâmico (placar, placar por quarto, quarto atual, feed jogada-a-
+ *          jogada). O front busca isto ao abrir a página e depois recebe só a
+ *          parte dinâmica via SSE (streamAoVivo).
+ */
+export const getAoVivoAbertura = async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(400).json({ message: "id de jogo inválido" });
+    }
+
+    const jogo = await Jogo.findById(id)
+      .populate("competicao_id", "nome ano")
+      .populate("equipe_a_id", "nome_equipe")
+      .populate("equipe_b_id", "nome_equipe")
+      .lean();
+    if (!jogo) return res.status(404).json({ message: "Jogo não encontrado" });
+
+    const base = {
+      jogo: {
+        _id: jogo._id,
+        data_jogo: jogo.data_jogo,
+        local: jogo.local || null,
+        status: jogo.status,
+        competicao: jogo.competicao_id
+          ? { nome: jogo.competicao_id.nome, ano: jogo.competicao_id.ano }
+          : null,
+        equipe_a: jogo.equipe_a_id
+          ? { _id: jogo.equipe_a_id._id, nome_equipe: jogo.equipe_a_id.nome_equipe }
+          : null,
+        equipe_b: jogo.equipe_b_id
+          ? { _id: jogo.equipe_b_id._id, nome_equipe: jogo.equipe_b_id.nome_equipe }
+          : null,
+      },
+    };
+
+    const sumula = await Sumula.findOne({ jogo_id: id })
+      .populate("jogadores_a.atleta_id", "nome_completo")
+      .populate("jogadores_b.atleta_id", "nome_completo");
+
+    if (!sumula) {
+      // Jogo agendado sem súmula ainda — devolve o esqueleto.
+      return res.json({
+        ...base,
+        arbitros: null,
+        tecnicos: { A: [], B: [] },
+        elenco: { A: [], B: [] },
+        placar: { A: jogo.placar_a || 0, B: jogo.placar_b || 0 },
+        placar_por_quarto: {},
+        faltas_equipe_por_quarto: {},
+        quarto_atual: 1,
+        em_quadra: { A: [], B: [] },
+        feed: [],
+      });
+    }
+
+    const estado = await computarEstado(sumula._id);
+    res.json({
+      ...base,
+      arbitros: montarArbitros(sumula),
+      tecnicos: montarTecnicos(sumula),
+      elenco: montarElenco(sumula),
+      ...montarDinamicoAoVivo(sumula, estado),
+    });
+  } catch (error) {
+    console.error("[public] getAoVivoAbertura:", error);
+    res
+      .status(500)
+      .json({ message: "Erro ao buscar dados ao vivo", error: error.message });
+  }
+};
+
+/**
+ * @desc    Stream SSE da parte dinâmica do jogo ao vivo. Cada alteração de
+ *          estado feita pelo mesário (registrar/cancelar/editar evento) é
+ *          empurrada aqui pelo aoVivoBus. Também envia heartbeat para manter a
+ *          conexão viva atrás de proxies. Sem auth (visão pública).
+ */
+export const streamAoVivo = async (req, res) => {
+  const { id } = req.params;
+  if (!mongoose.isValidObjectId(id)) return res.status(400).end();
+
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    // Desabilita buffering do Nginx/proxies para SSE.
+    "X-Accel-Buffering": "no",
+  });
+  // Sugere ao EventSource reconectar em 5s se a conexão cair.
+  res.write("retry: 5000\n\n");
+
+  const enviar = (payload) => {
+    res.write(`data: ${JSON.stringify(payload)}\n\n`);
+  };
+
+  const ping = setInterval(() => res.write(": ping\n\n"), 25000);
+  const cancelar = aoVivoBus.inscrever(id, enviar);
+
+  req.on("close", () => {
+    clearInterval(ping);
+    cancelar();
+    res.end();
+  });
+};
+
+/**
+ * @desc    Stream SSE agregado para a home: UMA conexão recebe os placares de
+ *          TODOS os jogos ao vivo. Evita abrir um EventSource por card (que
+ *          estouraria o limite de 6 conexões/origem do HTTP/1.1). Cada mensagem:
+ *          { jogoId, placar:{A,B}, encerrado }.
+ */
+export const streamHomeAoVivo = async (req, res) => {
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no",
+  });
+  res.write("retry: 5000\n\n");
+
+  const enviar = (payload) => {
+    res.write(`data: ${JSON.stringify(payload)}\n\n`);
+  };
+
+  const ping = setInterval(() => res.write(": ping\n\n"), 25000);
+  const cancelar = aoVivoBus.inscreverHome(enviar);
+
+  req.on("close", () => {
+    clearInterval(ping);
+    cancelar();
+    res.end();
+  });
 };

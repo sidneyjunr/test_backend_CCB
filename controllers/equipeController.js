@@ -133,26 +133,29 @@ export const inscreverAtleta = async (req, res) => {
     const inscricaoExistente = await Inscricao.findOne({
       atleta_id: atleta._id,
       competicao_id: equipe.competicao_id,
+      categoria_id: equipe.categoria_id,
       status: { $in: ["pendente", "aprovado"] },
     });
 
     if (inscricaoExistente) {
       return res.status(400).json({
-        message: "Este atleta já possui uma inscrição ativa ou pendente.",
+        message:
+          "Este atleta já possui uma inscrição ativa ou pendente nesta categoria.",
       });
     }
 
-    // Verificar se atleta já jogou nesta competição (ja_jogou: true)
+    // Verificar se atleta já jogou nesta categoria (ja_jogou: true)
     const jaJogouNesta = await Inscricao.findOne({
       atleta_id: atleta._id,
       competicao_id: equipe.competicao_id,
+      categoria_id: equipe.categoria_id,
       ja_jogou: true,
     });
 
     if (jaJogouNesta) {
       return res.status(400).json({
         message:
-          "Este atleta já jogou nesta competição e não pode ser inscrito novamente na mesma categoria/competição.",
+          "Este atleta já jogou nesta categoria e não pode ser inscrito novamente em outro time da mesma categoria.",
       });
     }
 
@@ -160,6 +163,7 @@ export const inscreverAtleta = async (req, res) => {
       atleta_id: atleta._id,
       equipe_id: equipe._id,
       competicao_id: equipe.competicao_id,
+      categoria_id: equipe.categoria_id,
       status: "pendente",
     });
 
@@ -300,6 +304,12 @@ export const buscarAtletas = async (req, res) => {
     // Se fornecido equipe_id e competicao_id, filtrar atletas já inscritos NESTA equipe
     let atletasDisponiveis = atletasComStatus;
     if (equipe_id && competicao_id) {
+      // Categoria é determinada pela equipe alvo
+      const equipeAlvo = await Equipe.findById(equipe_id).select("categoria_id");
+      if (!equipeAlvo) {
+        return res.status(404).json({ message: "Equipe não encontrada." });
+      }
+
       const inscricoesPendentesOuAprovadas = await Inscricao.find({
         equipe_id: new mongoose.Types.ObjectId(equipe_id),
         competicao_id: new mongoose.Types.ObjectId(competicao_id),
@@ -310,9 +320,10 @@ export const buscarAtletas = async (req, res) => {
         i.atleta_id.toString()
       );
 
-      // Filtrar atletas que já jogaram nesta competição
+      // Filtrar atletas que já jogaram nesta categoria
       const atletasQueJogaram = await Inscricao.find({
         competicao_id: new mongoose.Types.ObjectId(competicao_id),
+        categoria_id: equipeAlvo.categoria_id,
         ja_jogou: true,
       });
 
@@ -368,18 +379,19 @@ export const criarSolicitacaoAgregamento = async (req, res) => {
       });
     }
 
-    // Verificar se atleta já jogou nesta competição (ja_jogou: true)
+    // Verificar se atleta já jogou nesta categoria (ja_jogou: true)
     const jaJogouNesta = await Inscricao.findOne({
       atleta_id,
       competicao_id: equipe.competicao_id,
+      categoria_id: equipe.categoria_id,
       ja_jogou: true,
     });
 
-    // Se já jogou nesta competição, verificar se está tentando agregar em OUTRO time
+    // Se já jogou nesta categoria, verificar se está tentando agregar em OUTRO time
     if (jaJogouNesta && jaJogouNesta.equipe_id.toString() !== equipe_id) {
       return res.status(400).json({
         message:
-          "Este atleta já jogou nesta competição e não pode ser agregado a outro time.",
+          "Este atleta já jogou nesta categoria e não pode ser agregado a outro time da mesma categoria.",
       });
     }
 
@@ -388,6 +400,7 @@ export const criarSolicitacaoAgregamento = async (req, res) => {
       atleta_id,
       equipe_id,
       competicao_id: equipe.competicao_id,
+      categoria_id: equipe.categoria_id,
       status: "pendente",
       tipo: "agregacao", // Marcar como agregação
     });

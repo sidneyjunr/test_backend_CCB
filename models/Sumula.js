@@ -53,6 +53,15 @@ const JogadorSumulaSchema = new mongoose.Schema(
     // pelas validações de substituição e pelo filtro da tela do mesário.
     em_quadra: { type: Boolean, default: false },
     capitao: { type: Boolean, default: false },
+    // FIBA Art. 7.9 / B.4.2 — capitao atua como jogador-tecnico quando a
+    // equipe nao tem tecnico nem 1o assistente inscrito. O atleta tambem
+    // aparece em comissao_* como ComissaoMembro com atleta_id setado.
+    jogador_tecnico: { type: Boolean, default: false },
+    // FIBA Art. 7.9 — quando o jogador-tecnico e expulso (GD), a equipe nao
+    // tem assistente inscrito, entao um novo capitao e designado e assume como
+    // jogador-tecnico (2o CAP). Marcado aqui; tambem ganha jogador_tecnico=true
+    // e capitao=true. O original (expulso) permanece na comissao (linha TECNICO).
+    tecnico_sucessor: { type: Boolean, default: false },
     faltas: { type: Number, default: 0, min: 0 },
     excluido: { type: Boolean, default: false },
     desqualificado: { type: Boolean, default: false },
@@ -67,6 +76,14 @@ const ComissaoMembroSchema = new mongoose.Schema(
     tecnico_id: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "Tecnico",
+      default: null,
+    },
+    // FIBA Art. 7.9 — jogador-tecnico (player head coach). Quando setado,
+    // tecnico_id fica null e funcao = "Jogador-Tecnico". Aponta para o mesmo
+    // atleta presente em jogadores_* (espelhado por jogador_tecnico=true).
+    atleta_id: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Atleta",
       default: null,
     },
     assinatura_path: { type: String, default: null },
@@ -184,6 +201,26 @@ SumulaSchema.pre("save", async function () {
     const capitaoB = this.jogadores_b.filter((j) => j.capitao).length;
     if (capitaoA !== 1 || capitaoB !== 1) {
       throw new Error("Cada equipe precisa ter exatamente 1 capitao");
+    }
+
+    // Atleta sem numero pode estar na escalacao (chegou atrasado), mas nao
+    // pode ser titular nem capitao — recebe numero durante o jogo e entra
+    // como substituto.
+    const semNumero = (j) => j.numero === null || j.numero === undefined;
+    for (const [label, lista] of [
+      ["A", this.jogadores_a],
+      ["B", this.jogadores_b],
+    ]) {
+      if (lista.some((j) => j.titular && semNumero(j))) {
+        throw new Error(
+          `Equipe ${label}: titular precisa de numero de camisa`
+        );
+      }
+      if (lista.some((j) => j.capitao && semNumero(j))) {
+        throw new Error(
+          `Equipe ${label}: capitao precisa de numero de camisa`
+        );
+      }
     }
   }
 });

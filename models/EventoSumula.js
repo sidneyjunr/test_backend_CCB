@@ -7,6 +7,13 @@ const TIPOS_EVENTO = [
   "substituicao",
   "inicio_quarto",
   "fim_quarto",
+  // Snapshot de quem esta em quadra apos timeout / fim_quarto. FIBA: tecnico
+  // nao precisa anunciar pares de substituicao apos esses eventos. Mesario
+  // marca os 5 atletas em quadra e o sistema infere as entradas que faltam.
+  "set_em_quadra",
+  // Atleta escalado sem numero (chegou atrasado) recebe numero de camisa
+  // durante o jogo. Registrado como evento para entrar no botao desfazer.
+  "definir_numero",
 ];
 
 // FIBA 2024:
@@ -16,8 +23,10 @@ const TIPOS_EVENTO = [
 //   B = Tecnica de banco (comissao/substituto)
 //   U = Antidesportiva (2a U -> desqualificacao)
 //   D = Desqualificante (desqualificacao imediata)
+//   F = Briga (Art. 39 / B.8.3.14) — preenche todos os espacos restantes do
+//       atleta com "F". Conta como pessoal (entra em FALTAS_PESSOAIS).
 // P2 / U2 sao aliases legados mantidos para compatibilidade com eventos antigos.
-const TIPOS_FALTA = ["P", "T", "C", "B", "U", "D", "P2", "U2"];
+const TIPOS_FALTA = ["P", "T", "C", "B", "U", "D", "F", "P2", "U2"];
 
 const EventoSumulaSchema = new mongoose.Schema(
   {
@@ -77,6 +86,38 @@ const EventoSumulaSchema = new mongoose.Schema(
       default: null,
     },
 
+    // FIBA B.8.3.14 / B.8.3.15 — subtipo de briga.
+    //   "invasao"           = sair da area do banco durante briga (B.8.3.14)
+    //   "envolvimento_ativo" = participacao fisica ativa na briga (B.8.3.15)
+    // Quando setado em evento D/F, dispara fluxo especial de cascata:
+    //   - Invasao: pessoa banco recebe D + F nos slots restantes; tecnico recebe
+    //     UNICA B2 (deduplicada por fight_group_id).
+    //   - Envolvimento: pessoa recebe D2 + F restantes; tecnico recebe UNICA B2;
+    //     se proprio tecnico envolvido recebe D2+F+F (sem B2 extra).
+    subtipo_briga: {
+      type: String,
+      enum: ["invasao", "envolvimento_ativo", null],
+      default: null,
+    },
+
+    // Identificador comum a todos os eventos da mesma briga. Usado para
+    // deduplicar a cascata B2 do tecnico — uma briga gera UMA B2, mesmo com
+    // varios envolvidos. Mesma briga pode ser editada incrementalmente
+    // (adicionar mais envolvidos) reusando o mesmo fight_group_id.
+    fight_group_id: {
+      type: mongoose.Schema.Types.ObjectId,
+      default: null,
+    },
+
+    // FIBA B.8.3.13/.14/.15 — falta de membro da delegacao acompanhante.
+    // Anota-se com "B" (ou "B2") com circulo (B circulado / B2 circulado) na
+    // linha do tecnico principal. NAO conta para o limite de 3 tecnicas que
+    // gera GD do tecnico. PDF renderiza com SVG circle ao redor da letra.
+    marcador_circulo: {
+      type: Boolean,
+      default: false,
+    },
+
     // Categoria FIBA da pessoa que recebeu a falta. Usada pelo recálculo do
     // estado para decidir se a falta conta como falta de equipe e se
     // incrementa o contador pessoal do atleta.
@@ -131,7 +172,21 @@ const EventoSumulaSchema = new mongoose.Schema(
     // FIBA B.7: apenas o minuto inteiro do quarto (0-10) em que o timeout foi concedido.
     minuto_jogo: { type: Number, min: 0, max: 10, default: null },
 
+    // FIBA B.8.4 — regra "uso ou perde": no Q4 com 3/3 timeouts disponiveis,
+    // se o tecnico pede TO nos ultimos 2 minutos, perde automaticamente o 1o
+    // dos 3. Marcado em evento timeout sintetico (sem minuto_jogo) que
+    // antecede o TO real. Renderizado na sumula como caixa riscada.
+    perdido_2min: { type: Boolean, default: false },
+
     ponto_progressivo: { type: Number, default: null, min: 0 },
+
+    // Snapshot do conjunto em quadra para evento set_em_quadra. Lista de
+    // atleta_id (ate 5 elementos em jogos normais; menos quando o time
+    // continua com N-1 apos exclusao sem reposicao).
+    jogadores_em_quadra: {
+      type: [mongoose.Schema.Types.ObjectId],
+      default: undefined,
+    },
 
     cancelado: { type: Boolean, default: false },
 
@@ -161,12 +216,16 @@ EventoSumulaSchema.pre("validate", async function () {
     if (!this.equipe) {
       throw new Error("Evento falta requer equipe");
     }
-    // Faltas C (tecnico) e B (banco/comissao) podem ser atribuidas ao
-    // tecnico_id em vez de jogador_id. Demais tipos exigem jogador.
-    const ehFaltaTecnico =
-      (this.tipo_falta === "C" || this.tipo_falta === "B") && this.tecnico_id;
-    if (!this.jogador_id && !ehFaltaTecnico) {
-      throw new Error("Evento falta requer jogador_id ou tecnico_id (C/B)");
+    // Faltas C (tecnico), B (banco/comissao) e D (desqualificante — direta
+    // ou via briga, FIBA Art. 39 / B.8.3.14) podem ser atribuidas ao
+    // tecnico_id em vez de jogador_id. FIBA Art. 7.9 — quando o tecnico e um
+    // jogador-tecnico, C/B/D sao atribuidas ao jogador_id dele (com
+    // categoria_pessoa="tecnico"). Demais tipos exigem jogador.
+    const ehFaltaComissao =
+      (this.tipo_falta === "C" || this.tipo_falta === "B" || this.tipo_falta === "D") &&
+      (this.tecnico_id || this.jogador_id);
+    if (!this.jogador_id && !ehFaltaComissao) {
+      throw new Error("Evento falta requer jogador_id ou tecnico_id (C/B/D)");
     }
   }
   if (this.tipo === "substituicao") {
@@ -180,6 +239,20 @@ EventoSumulaSchema.pre("validate", async function () {
   }
   if (this.tipo === "timeout" && !this.equipe) {
     throw new Error("Evento timeout requer equipe");
+  }
+  if (this.tipo === "set_em_quadra") {
+    if (!this.equipe) {
+      throw new Error("Evento set_em_quadra requer equipe");
+    }
+    if (
+      !Array.isArray(this.jogadores_em_quadra) ||
+      this.jogadores_em_quadra.length < 2 ||
+      this.jogadores_em_quadra.length > 5
+    ) {
+      throw new Error(
+        "Evento set_em_quadra requer 2 a 5 atletas em jogadores_em_quadra",
+      );
+    }
   }
 });
 

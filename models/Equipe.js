@@ -18,6 +18,9 @@ const EquipeSchema = new mongoose.Schema({
     required: true,
   },
   categoria_id: { type: mongoose.Schema.Types.ObjectId, required: true },
+  // Grupo dentro da categoria (subdoc Competicao.categorias[].grupos[]).
+  // Null quando a categoria é chaveamento único ou a equipe ainda não foi atribuída.
+  grupo_id: { type: mongoose.Schema.Types.ObjectId, default: null },
 });
 
 EquipeSchema.index({ tecnico_id: 1 });

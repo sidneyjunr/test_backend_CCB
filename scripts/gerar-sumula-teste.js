@@ -35,12 +35,21 @@ const EQ_B_ID = "equipe_b_id";
 // ---------- Helpers ----------
 let seq = 0;
 const nextSeq = () => ++seq;
-const mkJog = ({ id, nome, numero, titular, capitao = false, faltas = 0 }) => ({
+const mkJog = ({
+  id,
+  nome,
+  numero,
+  titular,
+  capitao = false,
+  faltas = 0,
+  jogador_tecnico = false,
+}) => ({
   atleta_id: { _id: id, nome_completo: nome },
   numero,
   titular,
   em_quadra: titular,
   capitao,
+  jogador_tecnico,
   faltas,
   excluido: false,
   desqualificado: false,
@@ -48,7 +57,7 @@ const mkJog = ({ id, nome, numero, titular, capitao = false, faltas = 0 }) => ({
 
 // ---------- Jogadores Equipe A (10 atletas — 2 slots ficam vazios) ----------
 const jogadoresA = [
-  mkJog({ id: ATL("A", 1),  nome: "Marcelo Silva Oliveira",      numero: 4,  titular: true, capitao: true }),
+  mkJog({ id: ATL("A", 1),  nome: "Marcelo Silva Oliveira",      numero: 4,  titular: true, capitao: true, jogador_tecnico: true }),
   mkJog({ id: ATL("A", 2),  nome: "Rafael Nascimento Costa",     numero: 7,  titular: true }),
   mkJog({ id: ATL("A", 3),  nome: "Lucas Pereira Gomes",         numero: 10, titular: true }),
   mkJog({ id: ATL("A", 4),  nome: "Fernando Alves Dias",         numero: 12, titular: true }),
@@ -62,7 +71,7 @@ const jogadoresA = [
 
 // ---------- Jogadores Equipe B (12 atletas — roster completo) ----------
 const jogadoresB = [
-  mkJog({ id: ATL("B", 1),  nome: "Eduardo Moraes Teixeira",     numero: 3,  titular: true, capitao: true }),
+  mkJog({ id: ATL("B", 1),  nome: "Eduardo Moraes Teixeira",     numero: 3,  titular: true, capitao: true, jogador_tecnico: true }),
   mkJog({ id: ATL("B", 2),  nome: "Rodrigo Pinto Machado",       numero: 5,  titular: true }),
   mkJog({ id: ATL("B", 3),  nome: "André Luiz Castro",           numero: 8,  titular: true }),
   mkJog({ id: ATL("B", 4),  nome: "Felipe Ramos Nogueira",       numero: 11, titular: true }),
@@ -192,6 +201,49 @@ addFalta(4, "A", ATL("A", 5), "P");
 addTimeout(4, "A", 2);
 addPonto(4, "B", ATL("B", 1), 1);
 addPonto(4, "A", ATL("A", 5), 3);
+
+// --- Q4: BRIGA (FIBA B.8.3.14/.15) — cenário jogador-técnico ---
+// Helper p/ evento de briga (categoria + subtipo + fight_group + cascata).
+const addBriga = ({
+  equipe,
+  jogador_id,
+  categoria,
+  tipo_falta = "D",
+  lances_livres = 2,
+  fight_group_id,
+  cascata_de = null,
+}) => {
+  eventos.push({
+    sequencia: nextSeq(),
+    tipo: "falta",
+    quarto: 4,
+    equipe,
+    jogador_id,
+    tecnico_id: null,
+    categoria_pessoa: categoria,
+    tipo_falta,
+    lances_livres,
+    subtipo_briga: "envolvimento_ativo",
+    fight_group_id,
+    cascata_de,
+    cancelado: false,
+  });
+};
+
+// Equipe A — JT principal Marcelo (#4) ENVOLVIDO como coach (D2) + substituto
+// Bruno (#23). JT-principal envolvido → SEM cascata B2 (o D2 dele cobre).
+//   Marcelo: linha Head coach = D2 + F · linha jogador = D + F (sem nº).
+//   Bruno  : linha jogador = D2 + F (atleta normal).
+addBriga({ equipe: "A", jogador_id: ATL("A", 1), categoria: "tecnico",     fight_group_id: "fight_A_001" });
+addBriga({ equipe: "A", jogador_id: ATL("A", 8), categoria: "substituto",  fight_group_id: "fight_A_001" });
+
+// Equipe B — substituto Ricardo (#19) envolvido; JT principal Eduardo (#3)
+// NÃO envolvido → cascata B2 cai NELE (Art. 7.9 + Art. 37):
+//   Eduardo: linha Head coach = B2 · linha jogador = B (espelho, sem nº).
+//   Ricardo: linha jogador = D2 + F.
+addBriga({ equipe: "B", jogador_id: ATL("B", 7), categoria: "substituto",  fight_group_id: "fight_B_001" });
+addBriga({ equipe: "B", jogador_id: ATL("B", 1), categoria: "tecnico", tipo_falta: "B", fight_group_id: "fight_B_001", cascata_de: "cascade_marker" });
+
 addFimQuarto(4);
 
 // ---------- Marca em_quadra pós-substituições (reflete estado final) ----------
@@ -221,6 +273,20 @@ for (const ev of eventos) {
   const jog = lista.find((j) => j.atleta_id._id === ev.jogador_id);
   if (jog && ["P", "U", "D", "T"].includes(ev.tipo_falta)) jog.faltas += 1;
 }
+
+// ---------- Estado pós-briga (o script não roda o controller — seta à mão) ----
+// Quem recebeu D (briga) é desqualificado e sai de quadra. Eduardo (B1) só
+// recebeu cascata B2 (não desqualifica) — segue como técnico do time.
+const setDesq = (lista, id) => {
+  const j = lista.find((x) => x.atleta_id._id === id);
+  if (j) {
+    j.desqualificado = true;
+    j.em_quadra = false;
+  }
+};
+setDesq(jogadoresA, ATL("A", 1)); // JT Marcelo — DQ como coach
+setDesq(jogadoresA, ATL("A", 8)); // Bruno — DQ
+setDesq(jogadoresB, ATL("B", 7)); // Ricardo — DQ
 
 // ---------- Placar por quarto (computado a partir dos eventos) ----------
 const placarPorQuarto = [1, 2, 3, 4].map((q) => {
@@ -303,12 +369,15 @@ const sumula = {
   },
   jogadores_a: jogadoresA,
   jogadores_b: jogadoresB,
+  // FIBA Art. 7.9 — técnico principal é o jogador-técnico (atleta_id casa com o
+  // roster; tecnicoNome adiciona "(CAP)"). As faltas C/B/D dele caem em
+  // jogador_id com categoria "tecnico" e aparecem na linha Head coach.
   comissao_a: [
-    { nome: "JELENA TODOROVIC", funcao: "Técnico" },
+    { nome: "Marcelo Silva Oliveira", funcao: "Jogador-Técnico", atleta_id: ATL("A", 1) },
     { nome: "VLADIMIR DOSENOVIC", funcao: "1º Assistente Técnico" },
   ],
   comissao_b: [
-    { nome: "LEANDRO ARMANDO HIRIART", funcao: "Técnico" },
+    { nome: "Eduardo Moraes Teixeira", funcao: "Jogador-Técnico", atleta_id: ATL("B", 1) },
     { nome: "RAFAEL MARTINS DOS SANTOS", funcao: "1º Assistente Técnico" },
   ],
   placar_por_quarto: placarPorQuarto,
