@@ -87,6 +87,10 @@ const ComissaoMembroSchema = new mongoose.Schema(
       default: null,
     },
     assinatura_path: { type: String, default: null },
+    // FIBA Art. 7.9 — assinatura do jogador-tecnico e coletada ao vivo no
+    // pre-jogo e guardada SO nesta sumula (nao reusavel). Cloudinary id fica
+    // aqui para sobrescrever/limpar quando re-assinar.
+    assinatura_public_id: { type: String, default: null },
   },
   { _id: false }
 );
@@ -153,6 +157,8 @@ const SumulaSchema = new mongoose.Schema(
       houve: { type: Boolean, default: false },
       descricao: { type: String, default: "" },
     },
+
+    observacoes: { type: String, default: "" },
 
     hora_inicio: { type: Date, default: null },
     hora_fim: { type: Date, default: null },

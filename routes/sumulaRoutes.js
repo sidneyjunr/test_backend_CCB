@@ -1,4 +1,5 @@
 import express from "express";
+import multer from "multer";
 import rateLimit from "express-rate-limit";
 import { protect, admin } from "../middleware/authMiddleware.js";
 import {
@@ -11,6 +12,7 @@ import {
   patchNumeracao,
   patchTitulares,
   patchComissao,
+  uploadAssinaturaJogadorTecnico,
   iniciarSumula,
   definirNumeroJogador,
   registrarEvento,
@@ -27,6 +29,18 @@ import {
 } from "../controllers/sumulaController.js";
 
 const router = express.Router();
+
+const MAX_ASSINATURA_BYTES = 500 * 1024;
+const assinaturaUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_ASSINATURA_BYTES },
+  fileFilter: (req, file, cb) => {
+    if (!["image/png", "image/jpeg"].includes(file.mimetype)) {
+      return cb(new Error("MIME inválido (PNG/JPG)"));
+    }
+    cb(null, true);
+  },
+});
 
 // Rate limit especifico para eventos em tempo real (pico ~10-15 eventos/min num jogo)
 const eventoLimiter = rateLimit({
@@ -94,6 +108,13 @@ router.patch("/:id/escalacao", protect, admin, patchEscalacao);
 router.patch("/:id/numeracao", protect, admin, patchNumeracao);
 router.patch("/:id/titulares", protect, admin, patchTitulares);
 router.patch("/:id/comissao", protect, admin, patchComissao);
+router.post(
+  "/:id/assinatura-jogador-tecnico",
+  protect,
+  admin,
+  assinaturaUpload.single("assinatura"),
+  uploadAssinaturaJogadorTecnico,
+);
 router.post("/:id/iniciar", protect, admin, iniciarSumula);
 
 // --- Durante o jogo ---

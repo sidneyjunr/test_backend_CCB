@@ -20,6 +20,10 @@ import {
   QUARTO_FINAL,
 } from "../services/sumulaEstadoService.js";
 import * as aoVivoBus from "../services/aoVivoBus.js";
+import {
+  uploadBufferToCloudinary,
+  destroyCloudinaryAsset,
+} from "../config/cloudinary.js";
 
 const FALTAS_PESSOAIS_LIMITE = 5;
 // FIBA B.8.4: 2 TO na primeira metade, 3 na segunda metade.
@@ -952,6 +956,59 @@ export const patchComissao = async (req, res) => {
   } catch (error) {
     console.error("[sumula] patchComissao:", error);
     res.status(400).json({ message: error.message });
+  }
+};
+
+// --- ASSINATURA DO JOGADOR-TECNICO (pre-jogo, ao vivo) ---
+// FIBA Art. 7.9 — equipe sem tecnico inscrito usa o capitao como
+// jogador-tecnico. Ele nao tem cadastro de Tecnico (nem senha nem assinatura
+// reusavel), entao a assinatura e desenhada na hora e guardada SO nesta
+// sumula. Cada coleta sobrescreve a anterior (mesmo public_id).
+export const uploadAssinaturaJogadorTecnico = async (req, res) => {
+  const { id } = req.params;
+  const { equipe } = req.body;
+  const file = req.file;
+  try {
+    if (!["A", "B"].includes(equipe)) {
+      return res.status(400).json({ message: "equipe deve ser 'A' ou 'B'" });
+    }
+    if (!file?.buffer?.length) {
+      return res.status(400).json({ message: "Imagem da assinatura ausente" });
+    }
+    const sumula = await Sumula.findById(id);
+    if (!sumula) return res.status(404).json({ message: "Sumula nao encontrada" });
+    if (sumula.status !== "pre_jogo") {
+      return res
+        .status(400)
+        .json({ message: "Assinatura so pode ser coletada no pre-jogo" });
+    }
+
+    const comissao = equipe === "A" ? sumula.comissao_a : sumula.comissao_b;
+    const membro = (comissao || []).find((m) => m.atleta_id);
+    if (!membro) {
+      return res.status(400).json({
+        message: "Equipe nao usa jogador-tecnico — defina a comissao antes",
+      });
+    }
+
+    if (membro.assinatura_public_id) {
+      await destroyCloudinaryAsset(membro.assinatura_public_id);
+    }
+    const result = await uploadBufferToCloudinary(file.buffer, {
+      folder: "ccb/assinaturas/sumula",
+      public_id: `jt_${sumula._id}_${equipe}`,
+    });
+
+    membro.assinatura_path = result.secure_url;
+    membro.assinatura_public_id = result.public_id;
+    await sumula.save();
+    await popularSumula(sumula);
+    res.json({ sumula });
+  } catch (error) {
+    console.error("[sumula] uploadAssinaturaJogadorTecnico:", error);
+    res
+      .status(500)
+      .json({ message: "Erro ao salvar assinatura", error: error.message });
   }
 };
 
@@ -2826,7 +2883,7 @@ export const inserirEventoEntre = async (req, res) => {
 // --- FINALIZAR SUMULA ---
 export const finalizarSumula = async (req, res) => {
   const { id } = req.params;
-  const { protesto } = req.body || {};
+  const { protesto, observacoes } = req.body || {};
   try {
     const sumula = await Sumula.findById(id);
     if (!sumula) return res.status(404).json({ message: "Sumula nao encontrada" });
@@ -2856,6 +2913,9 @@ export const finalizarSumula = async (req, res) => {
         descricao: protesto.descricao || "",
       };
     }
+
+    sumula.observacoes =
+      typeof observacoes === "string" ? observacoes.trim() : "";
 
     // Snapshot das assinaturas atuais dos árbitros escalados — PDF histórico
     // precisa ficar imutável mesmo que o árbitro troque a assinatura depois.
@@ -2903,11 +2963,16 @@ export const finalizarSumula = async (req, res) => {
           tecs.map((t) => [t._id.toString(), { sig: t.assinatura_path || null, assist: t.is_assistente }])
         );
         return comissao.map((m) => {
+          const obj = m.toObject ? m.toObject() : m;
+          // FIBA Art. 7.9 — jogador-tecnico: assinatura ja foi coletada ao vivo
+          // no pre-jogo e vive na propria sumula. Preserva (nao tem Tecnico de
+          // onde puxar).
+          if (obj.atleta_id) return obj;
           const info = m.tecnico_id
             ? mapSig.get(m.tecnico_id.toString())
             : null;
           return {
-            ...(m.toObject ? m.toObject() : m),
+            ...obj,
             assinatura_path: info && !info.assist ? info.sig : null,
           };
         });
@@ -3060,6 +3125,12 @@ export const gerarPdfSumula = async (req, res) => {
         ...m,
         assinatura_path: null,
       }));
+
+      // Observações ainda não estão persistidas no banco (só ao finalizar).
+      // Front pode enviar o texto digitado via query para o preview refletir.
+      if (typeof req.query.observacoes === "string") {
+        sumulaObj.observacoes = req.query.observacoes.trim();
+      }
     }
 
     const pdfBuffer = await gerarSumulaPdf({

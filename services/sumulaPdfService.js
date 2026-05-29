@@ -877,6 +877,12 @@ body{
   pointer-events:none;
 }
 .hsh{margin-top:10px;border:1px dashed #000;padding:5px;font-family:"Courier New",monospace;font-size:7.5px;word-break:break-all}
+
+/* Observações do árbitro (pág. 2) */
+.obs{margin-top:12px;border:1.5px solid #000;padding:6px 8px}
+.obs h5{text-align:center;font-size:10.5px;font-weight:800;margin-bottom:4px;letter-spacing:1px}
+.obs .obs-bd{min-height:42px;font-size:10px;color:#0000CC;font-weight:600;white-space:pre-wrap;line-height:1.35;padding:2px 2px}
+.obs .obs-bd.empty{color:#0000CC;font-weight:700;text-align:center;font-style:italic}
 `;
 
 /* ====================================================================
@@ -1866,6 +1872,22 @@ const renderResumoTeam = ({ nome, label, resumo }) => {
   </div>`;
 };
 
+const renderObservacoes = (sumula) => {
+  const txt = (sumula?.observacoes || "").trim();
+  if (!txt) {
+    return `
+    <div class="obs">
+      <h5>OBSERVAÇÕES</h5>
+      <div class="obs-bd empty">NADA CONSTA</div>
+    </div>`;
+  }
+  return `
+    <div class="obs">
+      <h5>OBSERVAÇÕES</h5>
+      <div class="obs-bd">${esc(txt)}</div>
+    </div>`;
+};
+
 const gerarPagina2 = ({ sumula, eventos }) => {
   const nA = equipeNome(sumula.equipe_a_id).toUpperCase();
   const nB = equipeNome(sumula.equipe_b_id).toUpperCase();
@@ -1890,6 +1912,8 @@ const gerarPagina2 = ({ sumula, eventos }) => {
       ${renderResumoTeam({ nome: nA, label: "EQUIPE A", resumo: resumoA })}
       ${renderResumoTeam({ nome: nB, label: "EQUIPE B", resumo: resumoB })}
     </div>
+
+    ${renderObservacoes(sumula)}
 
   </div>`;
 };
