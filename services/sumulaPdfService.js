@@ -5,7 +5,9 @@ import fs from "fs";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const logoPath = path.join(__dirname, "..", "uploads", "ccb_logo.png");
+// Logo CCB usada no cabeçalho do PDF. Lemos de assets/ (versionado no git)
+// em vez de uploads/ (ignorado), garantindo que o binário chega em produção.
+const logoPath = path.join(__dirname, "..", "assets", "ccb_logo.png");
 const logoBase64 = fs.existsSync(logoPath)
   ? `data:image/png;base64,${fs.readFileSync(logoPath).toString("base64")}`
   : "";
